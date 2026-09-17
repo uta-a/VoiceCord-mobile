@@ -1,88 +1,106 @@
-// libvoicecord.so フェーズ1: post-Krisp 出力(x3)に固定テスト音(サイン波)を注入する。
-// フック対象: libkrisp_wrapper.so の NC clean 系(int16)。ShadowHook で
-// 未ロード lib への予約フックを使い、VC 参加で krisp がロードされた瞬間に有効化する。
+// libvoicecord.so フェーズ1: 送信 Opus エンコーダ入口の PCM に固定テスト音を注入する。
 //
-// Krisp SDK signature:
-//   int krispAudioNcCleanAmbientNoiseInt16(session, const int16* in, uint cnt,
-//                                          int16* out, uint outcnt);
-//   out(x3) が post-Krisp 出力。cnt(x2) が有効サンプル数(48k/10ms=480)。
+// 注入点(Krisp 非依存): libdiscord.so 内の WebRtcOpus_Encode（static/stripped, RVA でフック）。
+//   int WebRtcOpus_Encode(void* inst, const int16_t* audio_in, size_t samples,
+//                         size_t max_bytes, uint8_t* encoded);
+//   x1=audio_in が送信 PCM(int16/mono/48kHz), x2=samples(10ms=480 / 20ms=960)。
+//   CALL_PREV の前に audio_in へサイン波を加算すれば、エンコード結果に混ざって送信される。
+//   Krisp の有無・Play アセット配信に依存しないため再パック(LSPatch)版でも発火する。
 //
-// proxy はオーディオスレッド上でフレーム毎(~100Hz)に呼ばれるホットパス。
-// clean / clean_ws は別関数だが両方フックするため、共有状態は atomic 化し
-// 位相は proxy ごとに分離する(実際に呼ばれるのは通常どちらか一方)。
+// 実行時 base の算出: libdiscord.so のエクスポート JNI シンボル
+//   Java_org_webrtc_BuiltinAudioEncoderFactoryFactory_nativeCreateBuiltinAudioEncoderFactory
+//   (dynsym RVA 0x9d39ec) の実行時アドレスから base を逆算し、base + 0x56b758 をフックする。
+//   ※ RVA は Discord バージョン依存(345.9)。更新時は signatures/ で版別管理が必要。
 #include <jni.h>
 #include <android/log.h>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <pthread.h>
+#include <unistd.h>
 #include "shadowhook.h"
 
 #define TAG "VoiceCord"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-typedef int (*krisp_clean_int16_t)(void *, const int16_t *, uint32_t, int16_t *, uint32_t);
+// Discord 345.9 arm64 libdiscord.so の RVA(Ghidra 導出)。
+static const uintptr_t kAnchorRva = 0x9d39ec;      // nativeCreateBuiltinAudioEncoderFactory
+static const char *kAnchorSym = "Java_org_webrtc_BuiltinAudioEncoderFactoryFactory_nativeCreateBuiltinAudioEncoderFactory";
+static const uintptr_t kWebRtcOpusEncodeRva = 0x56b758;
+
+typedef int (*webrtc_opus_encode_t)(void *, const int16_t *, size_t, size_t, uint8_t *);
 
 static const double kFreq = 440.0, kSr = 48000.0, kAmp = 0.25;
 static const double kTwoPi = 6.283185307179586;
 
 static std::atomic<bool> g_inject{true};
 static std::atomic<int> g_calls{0};
+static void *g_orig_encode = nullptr;
+static void *g_stub = nullptr;
 
-static void *g_orig_clean = nullptr;
-static void *g_orig_clean_ws = nullptr;
-
-// out バッファ(post-Krisp)にサイン波を加算する。位相は呼び出し元(proxy)が保持する。
-static void mix_sine(int16_t *out, uint32_t n, double *phase) {
-  if (out == nullptr || n == 0 || n > 8192) return;
-  double p = *phase;
-  for (uint32_t i = 0; i < n; i++) {
+// audio_in(送信 PCM)にサイン波を加算する。位相は連続させる。
+static void mix_sine(int16_t *buf, size_t n) {
+  static double phase = 0.0;
+  if (buf == nullptr || n == 0 || n > 8192) return;
+  double p = phase;
+  for (size_t i = 0; i < n; i++) {
     double s = kAmp * sin(p);
     p += kTwoPi * kFreq / kSr;
     if (p > kTwoPi) p -= kTwoPi;
-    int v = (int)out[i] + (int)lround(s * 32767.0);
+    int v = (int)buf[i] + (int)lround(s * 32767.0);
     if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-    out[i] = (int16_t)v;
+    buf[i] = (int16_t)v;
   }
-  *phase = p;
+  phase = p;
 }
 
-static int proxy_clean(void *session, const int16_t *in, uint32_t cnt, int16_t *out, uint32_t outcnt) {
-  static double phase = 0.0;  // このスレッド/関数専用の位相
-  int ret = SHADOWHOOK_CALL_PREV(proxy_clean, session, in, cnt, out, outcnt);
+static int proxy_encode(void *inst, const int16_t *audio_in, size_t samples,
+                        size_t max_bytes, uint8_t *encoded) {
   if (g_calls.load(std::memory_order_relaxed) < 3) {
-    LOG("clean call#%d cnt=%u outcnt=%u out=%p", g_calls.fetch_add(1, std::memory_order_relaxed), cnt, outcnt, out);
+    LOG("WebRtcOpus_Encode call#%d samples=%zu audio_in=%p",
+        g_calls.fetch_add(1, std::memory_order_relaxed), samples, audio_in);
   }
-  if (g_inject.load(std::memory_order_relaxed) && cnt > 0 && cnt <= outcnt) mix_sine(out, cnt, &phase);
-  return ret;
-}
-
-static int proxy_clean_ws(void *session, const int16_t *in, uint32_t cnt, int16_t *out, uint32_t outcnt) {
-  static double phase = 0.0;
-  int ret = SHADOWHOOK_CALL_PREV(proxy_clean_ws, session, in, cnt, out, outcnt);
-  if (g_calls.load(std::memory_order_relaxed) < 3) {
-    LOG("clean_ws call#%d cnt=%u outcnt=%u out=%p", g_calls.fetch_add(1, std::memory_order_relaxed), cnt, outcnt, out);
+  // audio_in は const だが実体は書き換え可能な送信バッファ。エンコード前に加算する。
+  if (g_inject.load(std::memory_order_relaxed) && audio_in != nullptr && samples > 0 && samples <= 8192) {
+    mix_sine(const_cast<int16_t *>(audio_in), samples);
   }
-  if (g_inject.load(std::memory_order_relaxed) && cnt > 0 && cnt <= outcnt) mix_sine(out, cnt, &phase);
-  return ret;
+  return SHADOWHOOK_CALL_PREV(proxy_encode, inst, audio_in, samples, max_bytes, encoded);
 }
 
-// 予約フックを設置する。成功(stub 非 null)なら true。
-// 未ロードでも PENDING(errno=1)で stub が返るため、それも成功として扱う。
-static bool hook_one(const char *name, void *proxy, void **orig) {
-  void *stub = shadowhook_hook_sym_name("libkrisp_wrapper.so", name, proxy, orig);
-  int e = shadowhook_get_errno();
-  LOG("hook %s stub=%p errno=%d (%s)", name, stub, e, shadowhook_to_errmsg(e));
-  return stub != nullptr;
+// libdiscord.so のロードを待って base を解決し、WebRtcOpus_Encode をフックする。
+static void *install_thread(void *) {
+  for (int tries = 0; tries < 120; tries++) {  // 最大 ~60s
+    void *h = shadowhook_dlopen("libdiscord.so");
+    if (h != nullptr) {
+      void *anchor = shadowhook_dlsym(h, kAnchorSym);
+      shadowhook_dlclose(h);
+      if (anchor != nullptr) {
+        uintptr_t base = (uintptr_t)anchor - kAnchorRva;
+        void *target = (void *)(base + kWebRtcOpusEncodeRva);
+        LOG("libdiscord base=%p anchor=%p target(WebRtcOpus_Encode)=%p", (void *)base, anchor, target);
+        g_stub = shadowhook_hook_func_addr(target, (void *)proxy_encode, &g_orig_encode);
+        int e = shadowhook_get_errno();
+        LOG("hook WebRtcOpus_Encode stub=%p errno=%d (%s)", g_stub, e, shadowhook_to_errmsg(e));
+        return nullptr;
+      }
+      LOG("anchor sym 未解決。リトライ");
+    }
+    usleep(500 * 1000);
+  }
+  LOG("libdiscord.so を解決できず(タイムアウト)");
+  return nullptr;
 }
 
-// ShadowHook の init は Java 側(ShadowHook.init)で済ませる前提。ここではフックのみ設置。
-// 戻り値: 0=OK, 負値=フック失敗コード(NativeBridge の契約に合わせる)。
+// ShadowHook の init は Java 側(ShadowHook.init)で済ませる前提。
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_uta_voicecord_NativeBridge_nativeInit(JNIEnv *, jclass) {
-  LOG("nativeInit: shadowhook version=%s (init は Java 側)", shadowhook_get_version());
-  bool ok1 = hook_one("krispAudioNcCleanAmbientNoiseInt16", (void *)proxy_clean, &g_orig_clean);
-  bool ok2 = hook_one("krispAudioNcWithStatsCleanAmbientNoiseInt16", (void *)proxy_clean_ws, &g_orig_clean_ws);
-  if (!ok1 && !ok2) return -1;  // どちらも設置できなければ失敗
+  LOG("nativeInit: shadowhook version=%s", shadowhook_get_version());
+  pthread_t t;
+  if (pthread_create(&t, nullptr, install_thread, nullptr) != 0) {
+    LOG("pthread_create 失敗");
+    return -1;
+  }
+  pthread_detach(t);
   return 0;
 }
 
