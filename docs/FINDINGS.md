@@ -98,3 +98,22 @@ VC 参加で krisp ロード検知）。**しかし clean 関数が一度も呼�
 ### この方式の利点
 - 再パック版でも動く（Krisp/Play 非依存）。
 - opus 入口は AGC 等も通過した最終段 → 注入音の音量が後処理で変わらない。
+
+---
+
+# フェーズ2 実装(2026-09-18): 命令プロトコル + デコード
+
+adbブロードキャストで音声ファイルを指定→MediaCodecでデコード→48k/int16/mono化→
+native SPSCリングバッファ→intercept pre で送信PCMに合成、を実装。実機で:
+- `decode done total=191865 samples(48k)`(44.1k stereo mp3→48k mono、リサンプル+モノ化動作)
+- token検証・CommandReceiver動的登録(RECEIVER_EXPORTED)・クラッシュなし・VC維持 を確認。
+- 可聴確認(受信側で660Hz)は送信中(WebRtcOpus_Encoceが発火する=マイク送信中)に行う。
+  リングは送信が起きて初めて消費される(state playing ビットが残る場合は送信していないだけ)。
+
+## セキュリティギャップ(フェーズ3で解消予定・重要)
+現状は **token 一致のみ** の最小検証で、CommandReceiver は exported。
+- ローカルパスの音声を読む(任意ファイル読み出しの authority 制限なし)。
+- 送信元パッケージの署名検証なし、content:// URI 権限委譲なし。
+→ token を知る同一端末上のアプリ/adb 実行者が、Discord が読めるパスの音声を送信音声に
+   混入できる。**フェーズ3のコンパニオンで FileProvider(content:// + grantUriPermission)、
+   getSentFromPackage() + 署名一致、authority 検証を実装して閉じる。**

@@ -1,0 +1,222 @@
+package dev.uta.voicecord;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+
+import de.robv.android.xposed.XposedBridge;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.ShortBuffer;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// フェーズ2: adb ブロードキャストから PLAY/STOP/SET/PING を受け、音声ファイルをデコードして
+// 48kHz/int16/mono の PCM を native リングへ投入する。
+//
+// セキュリティ(フェーズ2は最小限): token 一致を必須にするのみ。
+//   FileProvider/content:// URI 権限・送信元パッケージ署名検証・任意ファイル読み出しの
+//   authority 制限は【フェーズ3のコンパニオンで実装】。現状は「トークンを知るローカルの
+//   adb 実行者がローカルパスの音声を鳴らせる」だけの開発用。exported レシーバなので
+//   本番ではトークンだけでは不十分(docs/FINDINGS.md にギャップとして記載)。
+public class CommandReceiver extends BroadcastReceiver {
+
+    public static final String ACTION_PLAY = "dev.uta.voicecord.PLAY";
+    public static final String ACTION_STOP = "dev.uta.voicecord.STOP";
+    public static final String ACTION_SET = "dev.uta.voicecord.SET";
+    public static final String ACTION_PING = "dev.uta.voicecord.PING";
+
+    // 再生世代。PLAY/STOP のたびに +1 し、旧デコードスレッドは自分の世代と不一致になったら
+    // 自発終了する。これで PLAY 連打/STOP 時の複数 producer 同時書き込み(SPSC 破綻)と
+    // 満杯時の無限ループ張り付きを防ぐ。
+    static final AtomicInteger GEN = new AtomicInteger(0);
+
+    @Override
+    public void onReceive(Context context, Intent intent) {
+        String action = intent == null ? null : intent.getAction();
+        if (action == null) return;
+
+        // token 検証(全アクション必須)。
+        String token = intent.getStringExtra("token");
+        if (Entry.TOKEN == null || !Entry.TOKEN.equals(token)) {
+            XposedBridge.log("[voicecord] token 不一致で拒否: action=" + action);
+            return;
+        }
+
+        if (ACTION_STOP.equals(action)) {
+            GEN.incrementAndGet();     // 走行中デコードスレッドを終了させる
+            NativeBridge.nativeStop();
+        } else if (ACTION_SET.equals(action)) {
+            float gain = intent.getFloatExtra("gain", 1.0f);
+            float duck = intent.getFloatExtra("duck", 1.0f);
+            NativeBridge.nativeSetParams(gain, duck);
+        } else if (ACTION_PING.equals(action)) {
+            XposedBridge.log("[voicecord] state=" + NativeBridge.nativeState());
+        } else if (ACTION_PLAY.equals(action)) {
+            String path = intent.getStringExtra("path");
+            float gain = intent.getFloatExtra("gain", 1.0f);
+            float duck = intent.getFloatExtra("duck", 1.0f);
+            if (path == null) {
+                XposedBridge.log("[voicecord] PLAY: path 無し");
+                return;
+            }
+            NativeBridge.nativeSetParams(gain, duck);
+            int myGen = GEN.incrementAndGet();  // 旧デコードスレッドを終了させる
+            NativeBridge.nativeStop();          // 前の再生分をリングから捨てる
+            Thread t = new Thread(new DecodeTask(path, myGen), "voicecord-decode");
+            t.start();
+        }
+    }
+
+    // 音声ファイルを 48kHz/int16/mono にデコードし、native リングへ背圧付きで投入する。
+    // 匿名クラスは d8 8.2.2 でクラッシュするため名前付き Runnable にする。
+    static final class DecodeTask implements Runnable {
+        private final String path;
+        private final int gen;  // 自分の再生世代。GEN と不一致になったら中断する。
+
+        DecodeTask(String path, int gen) {
+            this.path = path;
+            this.gen = gen;
+        }
+
+        @Override
+        public void run() {
+            MediaExtractor ex = new MediaExtractor();
+            MediaCodec codec = null;
+            try {
+                ex.setDataSource(path);
+                int track = -1;
+                String mime = null;
+                for (int i = 0; i < ex.getTrackCount(); i++) {
+                    MediaFormat f = ex.getTrackFormat(i);
+                    String m = f.getString(MediaFormat.KEY_MIME);
+                    if (m != null && m.startsWith("audio/")) {
+                        track = i; mime = m; break;
+                    }
+                }
+                if (track < 0) {
+                    XposedBridge.log("[voicecord] audio track 無し: " + path);
+                    return;
+                }
+                ex.selectTrack(track);
+                MediaFormat fmt = ex.getTrackFormat(track);
+                int srcRate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+                int channels = fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)
+                        ? fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) : 1;
+                XposedBridge.log("[voicecord] decode start rate=" + srcRate + " ch=" + channels + " mime=" + mime);
+
+                codec = MediaCodec.createDecoderByType(mime);
+                codec.configure(fmt, null, null, 0);
+                codec.start();
+
+                MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                boolean sawInputEOS = false;
+                boolean sawOutputEOS = false;
+                long total = 0;
+                // リサンプル用の位相(前フレーム末尾を跨ぐ線形補間の残差)。
+                double resamplePos = 0.0;
+                short last = 0;
+                boolean havePrev = false;
+
+                while (!sawOutputEOS) {
+                    if (GEN.get() != gen) {  // STOP / 新 PLAY で中断(finally で codec 解放)
+                        XposedBridge.log("[voicecord] decode 中断(gen)");
+                        return;
+                    }
+                    if (!sawInputEOS) {
+                        int inIx = codec.dequeueInputBuffer(10000);
+                        if (inIx >= 0) {
+                            ByteBuffer ib = codec.getInputBuffer(inIx);
+                            int sz = ex.readSampleData(ib, 0);
+                            if (sz < 0) {
+                                codec.queueInputBuffer(inIx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                                sawInputEOS = true;
+                            } else {
+                                codec.queueInputBuffer(inIx, 0, sz, ex.getSampleTime(), 0);
+                                ex.advance();
+                            }
+                        }
+                    }
+                    int outIx = codec.dequeueOutputBuffer(info, 10000);
+                    if (outIx >= 0) {
+                        if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) sawOutputEOS = true;
+                        if (info.size > 0) {
+                            ByteBuffer ob = codec.getOutputBuffer(outIx);
+                            ob.position(info.offset);
+                            ob.limit(info.offset + info.size);
+                            ShortBuffer sb = ob.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer();
+                            int n = sb.remaining();
+                            short[] pcm = new short[n];
+                            sb.get(pcm);
+                            // ステレオ→モノ
+                            short[] mono;
+                            if (channels >= 2) {
+                                int frames = n / channels;
+                                mono = new short[frames];
+                                for (int i = 0; i < frames; i++) {
+                                    int acc = 0;
+                                    for (int c = 0; c < channels; c++) acc += pcm[i * channels + c];
+                                    mono[i] = (short) (acc / channels);
+                                }
+                            } else {
+                                mono = pcm;
+                            }
+                            // 48kHz へ線形リサンプル(srcRate==48000 ならそのまま)
+                            short[] out;
+                            if (srcRate == 48000) {
+                                out = mono;
+                            } else {
+                                double ratio = 48000.0 / srcRate;
+                                int outLen = (int) (mono.length * ratio);
+                                out = new short[outLen];
+                                for (int j = 0; j < outLen; j++) {
+                                    double srcIdx = j / ratio;
+                                    int i0 = (int) srcIdx;
+                                    double frac = srcIdx - i0;
+                                    short a = (i0 == 0 && havePrev) ? last : (i0 < mono.length ? mono[i0] : 0);
+                                    short b = (i0 + 1 < mono.length) ? mono[i0 + 1] : a;
+                                    out[j] = (short) (a + (b - a) * frac);
+                                }
+                                if (mono.length > 0) { last = mono[mono.length - 1]; havePrev = true; }
+                            }
+                            feedWithBackpressure(out);
+                            total += out.length;
+                        }
+                        codec.releaseOutputBuffer(outIx, false);
+                    }
+                }
+                XposedBridge.log("[voicecord] decode done total=" + total + " samples(48k)");
+            } catch (Throwable e) {
+                XposedBridge.log("[voicecord] decode 失敗:");
+                XposedBridge.log(e);
+            } finally {
+                try { if (codec != null) { codec.stop(); codec.release(); } } catch (Throwable ignore) {}
+                try { ex.release(); } catch (Throwable ignore) {}
+            }
+        }
+
+        // リングが満杯なら少し待って残りを投入する(送信が 48k/s で消費する)。
+        private void feedWithBackpressure(short[] pcm) {
+            int off = 0;
+            while (off < pcm.length) {
+                if (GEN.get() != gen) return;  // STOP/新PLAYで満杯待ちループを抜ける
+                int len = pcm.length - off;
+                short[] chunk;
+                if (off == 0 && len == pcm.length) {
+                    chunk = pcm;
+                } else {
+                    chunk = new short[len];
+                    System.arraycopy(pcm, off, chunk, 0, len);
+                }
+                int w = NativeBridge.nativeWrite(chunk, len);
+                off += w;
+                if (w < len) {
+                    try { Thread.sleep(20); } catch (InterruptedException ie) { return; }
+                }
+            }
+        }
+    }
+}

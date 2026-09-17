@@ -16,7 +16,8 @@ rm -rf "$BUILD"; mkdir -p "$BUILD/classes"
 
 echo "[1/6] javac(スタブ+Entry+NativeBridge, ShadowHook は classpath 参照)"
 find "$SRC/src" -name "*.java" > "$BUILD/sources.txt"
-"$JC" --release 8 -cp "$SRC/shadowhook-classes.jar" -d "$BUILD/classes" @"$BUILD/sources.txt"
+JAVAC_CP="$(cygpath -m -a "$ANDROID_JAR");$(cygpath -m -a "$SRC/shadowhook-classes.jar")"
+"$JC" --release 8 -cp "$JAVAC_CP" -d "$BUILD/classes" @"$BUILD/sources.txt"
 
 echo "[2/6] d8(dev/uta/voicecord + ShadowHook Java classes を dex 化。Xposedスタブは classpath 解決のみ)"
 APP_CLASSES=$(find "$BUILD/classes/dev/uta/voicecord" -name "*.class")
