@@ -1,0 +1,41 @@
+{
+  "_readme": [
+    "libdiscord.so 内の非エクスポート関数の RVA を Discord バージョン別に管理する。",
+    "現状これらの値は native/src/hook.cpp にハードコードされている(345.9)。",
+    "フェーズ4でこの表から読み込み、未対応バージョンは検出してフックを無効化する予定。",
+    "実行時アドレス = base + rva。base = (anchor の実行時アドレス) - anchor.rva。",
+    "anchor はエクスポート済み JNI シンボルで dlsym/ShadowHook で解決できる。",
+    "RVA 更新手順: Ghidra で libdiscord.so を解析し、anchor 基準(ImageBase 0x100000)で導出。"
+  ],
+  "com.discord": {
+    "345.9": {
+      "versionCode": 345009,
+      "so": "libdiscord.so",
+      "abi": "arm64-v8a",
+      "imageBase": "0x100000",
+      "anchor": {
+        "sym": "Java_org_webrtc_BuiltinAudioEncoderFactoryFactory_nativeCreateBuiltinAudioEncoderFactory",
+        "rva": "0x9d39ec"
+      },
+      "funcs": {
+        "WebRtcOpus_Encode": "0x56b758",
+        "opus_encode": "0x5a975c",
+        "opus_multistream_encode": "0x5902f0"
+      },
+      "hook": {
+        "target": "WebRtcOpus_Encode",
+        "method": "shadowhook_intercept_func_addr (pre)",
+        "args": "x0=inst, x1=audio_in(const int16* 送信PCM), x2=samples, x3=max_bytes, x4=encoded",
+        "note": "pre で x1 をコピー+合成したバッファへ差し替える。hook+CALL_PREV はトランポリンで SIGBUS のため不可。"
+      },
+      "krisp": {
+        "so": "libkrisp_wrapper.so",
+        "note": "再パック(LSPatch)版では Play Asset Delivery(-15 APP_NOT_OWNED)で Krisp モデルが取得できず未起動。post-Krisp 注入は不成立のため使わない。",
+        "krispAudioNcCleanAmbientNoiseInt16_vaddr": "0x8c064"
+      },
+      "vad": {
+        "note": "Discord独自VAD(voice_activity_detector.cpp)が encode 後段で無音時の RTP 送出を抑制。再生中の送信継続はキャプチャキープアライブ(nativeDataIsRecorded RVA 0x9e3980 / nativeCacheDirectBufferAddress 0x9e38c4)で対応予定(未実装)。"
+      }
+    }
+  }
+}
