@@ -23,6 +23,7 @@
 #include <cstring>
 #include <pthread.h>
 #include <unistd.h>
+#include "ring.h"
 #include "shadowhook.h"
 
 #define TAG "VoiceCord"
@@ -38,65 +39,13 @@ static void *g_stub = nullptr;
 static std::atomic<float> g_gain{1.0f};         // sfx(注入音)の音量
 static std::atomic<float> g_duck{1.0f};         // mic(元音声)の音量
 
-// --- SPSC リングバッファ(int16, 48kHz mono, 約10秒) ---
-// 書き手=デコードスレッド(nativeWrite)、読み手=オーディオスレッド(pre_encode)の 1:1。
-// index は単調増加カウンタ。実体アクセスは % で折り返す。stop は第三スレッドから
-// head を tail に合わせて捨てる(SPSC厳密ではないが index は常に範囲内でメモリ安全)。
-static const size_t kRingCap = 480000;
-static int16_t g_ring[kRingCap];
-static std::atomic<uint64_t> g_head{0};    // 読み(consumer=オーディオスレッドのみが書く)
-static std::atomic<uint64_t> g_tail{0};    // 書き(producer=デコードスレッド)
-static std::atomic<uint64_t> g_drainTo{0}; // stop 要求。consumer が g_head を進める目標
+// SPSC リングバッファ(約10秒 @48kHz mono)。実装は ring.h。host 単体テストあり。
+static Ring g_ring(480000);
 
 // 差し替え用の書込可能バッファ。前提(フェーズ1と同じ): 送信オーディオスレッドは単一、
 // 元 WebRtcOpus_Encode は pre 復帰後 g_buf を同期的に読み切って return する(Opus同期)。
 // TODO(フェーズ4): 複数エンコードスレッド対策で thread_local 化 + 版ズレガード + uninstall。
 static int16_t g_buf[8192];
-
-static inline int16_t clamp16(int v) {
-  if (v > 32767) return 32767;
-  if (v < -32768) return -32768;
-  return (int16_t)v;
-}
-
-// producer: リングへ書き込む。書けたサンプル数を返す。
-static size_t ring_write(const int16_t *pcm, size_t n) {
-  uint64_t head = g_head.load(std::memory_order_acquire);
-  uint64_t tail = g_tail.load(std::memory_order_relaxed);
-  size_t space = kRingCap - (size_t)(tail - head);
-  if (n > space) n = space;
-  for (size_t i = 0; i < n; i++) g_ring[(tail + i) % kRingCap] = pcm[i];
-  g_tail.store(tail + n, std::memory_order_release);
-  return n;
-}
-
-// consumer: リングから最大 n サンプル読み、dst に gain/duck で加算合成する。
-// g_head を書くのはこの関数(オーディオスレッド)のみ。stop 要求は g_drainTo で受け取る。
-static void ring_mix(int16_t *dst, size_t n, float gain, float duck) {
-  uint64_t head = g_head.load(std::memory_order_relaxed);
-  uint64_t tail = g_tail.load(std::memory_order_acquire);
-  uint64_t drainTo = g_drainTo.load(std::memory_order_relaxed);
-  if (drainTo > head) {  // stop 要求: 消費済み扱いにして捨てる(head は consumer 単独更新)
-    head = (drainTo < tail) ? drainTo : tail;
-    g_head.store(head, std::memory_order_release);
-  }
-  size_t avail = (size_t)(tail - head);
-  size_t m = (n < avail) ? n : avail;
-  for (size_t i = 0; i < m; i++) {
-    int mic = (int)lround(dst[i] * duck);
-    int sfx = (int)lround(g_ring[(head + i) % kRingCap] * gain);
-    dst[i] = clamp16(mic + sfx);
-  }
-  // duck を掛けた残り(sfx が尽きた分)も duck 適用しておく(duck<1 のとき自然)。
-  if (duck != 1.0f) {
-    for (size_t i = m; i < n; i++) dst[i] = clamp16((int)lround(dst[i] * duck));
-  }
-  if (m > 0) g_head.store(head + m, std::memory_order_release);
-}
-
-static inline bool ring_has_data() {
-  return g_tail.load(std::memory_order_acquire) != g_head.load(std::memory_order_acquire);
-}
 
 // WebRtcOpus_Encode 入口の pre 割り込み。x1=audio_in, x2=samples。
 static void pre_encode(shadowhook_cpu_context_t *ctx, void * /*data*/) {
@@ -108,10 +57,10 @@ static void pre_encode(shadowhook_cpu_context_t *ctx, void * /*data*/) {
   }
   if (!g_inject.load(std::memory_order_relaxed)) return;
   if (audio_in == nullptr || samples == 0 || samples > 8192) return;
-  if (!ring_has_data()) return;  // 再生中でなければ素通し(x1 差し替えなし)
+  if (!g_ring.hasData()) return;  // 再生中でなければ素通し(x1 差し替えなし)
   memcpy(g_buf, audio_in, samples * sizeof(int16_t));  // audio_in は読み取り可
-  ring_mix(g_buf, samples, g_gain.load(std::memory_order_relaxed),
-           g_duck.load(std::memory_order_relaxed));
+  g_ring.mix(g_buf, samples, g_gain.load(std::memory_order_relaxed),
+             g_duck.load(std::memory_order_relaxed));
   ctx->regs[1] = (uint64_t)(uintptr_t)g_buf;  // x1 を書込可能バッファへ差し替え
 }
 
@@ -166,7 +115,7 @@ Java_dev_uta_voicecord_NativeBridge_nativeWrite(JNIEnv *env, jclass, jshortArray
   if (len > alen) len = alen;  // 申告 len が配列長を超えても範囲外読みしない
   jshort *p = env->GetShortArrayElements(pcm, nullptr);
   if (p == nullptr) return 0;
-  size_t w = ring_write((const int16_t *)p, (size_t)len);
+  size_t w = g_ring.write((const int16_t *)p, (size_t)len);
   env->ReleaseShortArrayElements(pcm, p, JNI_ABORT);  // 変更しないので破棄
   return (jint)w;
 }
@@ -174,7 +123,7 @@ Java_dev_uta_voicecord_NativeBridge_nativeWrite(JNIEnv *env, jclass, jshortArray
 // 再生停止: 現在の tail までを drain 要求する(g_head は consumer 単独更新のため直接触らない)。
 extern "C" JNIEXPORT void JNICALL
 Java_dev_uta_voicecord_NativeBridge_nativeStop(JNIEnv *, jclass) {
-  g_drainTo.store(g_tail.load(std::memory_order_acquire), std::memory_order_relaxed);
+  g_ring.requestStop();
   LOG("stop");
 }
 
@@ -190,6 +139,6 @@ extern "C" JNIEXPORT jint JNICALL
 Java_dev_uta_voicecord_NativeBridge_nativeState(JNIEnv *, jclass) {
   int s = 0;
   if (g_stub != nullptr) s |= 1;
-  if (ring_has_data()) s |= 4;
+  if (g_ring.hasData()) s |= 4;
   return s;
 }
