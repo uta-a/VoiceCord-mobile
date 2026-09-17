@@ -5,3 +5,13 @@ apk/
 *.log
 __pycache__/
 .venv/
+
+# 動的解析の生成物・大容量バイナリ
+tools/dynamic/*.jar
+tools/dynamic/libgadget.so
+tools/dynamic/libgadget.so.xz
+tools/dynamic/gadgetloader.apk
+tools/dynamic/gadgetloader/assets/libgadget.so
+tools/dynamic/gadgetloader/build/
+tools/dynamic/out_patched/
+tools/dynamic/*.idsig
