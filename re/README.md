@@ -105,3 +105,18 @@ python re/frida_inject.py --mode gadget --amp 0.25 --freq 440
 | `frida_probe.py` | 引数・バッファ観察 | `VoiceCord/re/frida_krisp.py` |
 | `frida_inject.py` | サイン波注入 | `VoiceCord/re/frida_inject.py` |
 | `_common.py` / `_resolve.js` | 接続・シンボル解決の共通部 | (新規) |
+
+
+## この端末(XOM/APK埋込lib)での動的フック — frida_krisp_dlsym.py
+
+Android の一部端末では libkrisp_wrapper.so が APK 内から直接 mmap され、frida の
+module.base 検出が破綻する(export 解決・base+offset が全て失敗)。その場合は
+プロセス自身の dlsym で実アドレスを解決する `frida_krisp_dlsym.py` を使う。
+
+```bash
+# Discord をアイドル(VC未参加)にしてから起動し、起動後に実機でVC参加する
+python re/frida_krisp_dlsym.py --host 127.0.0.1:27042            # 観測のみ
+python re/frida_krisp_dlsym.py --host 127.0.0.1:27042 --inject   # サイン波注入(別端末で可聴確認)
+```
+
+注意: 音声中の attach は SIGSEGV を起こす。必ず「アイドルで起動 → 後から VC 参加」の順で。

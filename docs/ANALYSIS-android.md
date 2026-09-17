@@ -67,12 +67,21 @@ int krispAudioNcCleanAmbientNoiseInt16(
   → libdiscord.so が `dlopen`/`dlsym` で動的にロードして呼ぶ形と推定（要動的確認）。
   フックはエクスポート名で解決できるため問題にならない。
 
-## 動的解析（未実施 — 非root のため frida-gadget 埋め込みが必要）
+## 動的解析（frida-gadget 埋込で実施中）
 
-frida-server は root 前提で使えない。次段では frida-gadget を LSPatch で Discord に
-同梱して観測する（Discord の再パック・再署名・再インストールを伴う）。
+frida-server は root 前提で使えないため frida-gadget を LSPatch で Discord に同梱
+（`tools/dynamic/`）。非root で `Frida: Listening on 127.0.0.1:27042` まで到達。
 
-- [ ] Discord が実際に呼ぶ Krisp 関数はどれか（WithStats 版か素の版か、int16 か float か）
-- [ ] 呼び出し頻度（480サンプル/10ms=100Hz を想定）とフレーム長・サンプルレート
-- [ ] ミュート／VAD 無音時に呼ばれ続けるか
-- [ ] out=args[3] にサイン波を加算 → 別端末で可聴か（注入点の最終確定）
+実測で判明:
+- ✅ フォーマット: int16 / 48000Hz / mono（`AudioRecord: fmt 1, sr 48000, ch 1`）
+- ✅ フレーム長: 480サンプル/10ms → 約100Hz（`OpenSLESRecorder: frames per 10ms buffer: 480`）
+- ✅ libkrisp_wrapper.so は VC 参加時に dlopen される遅延ロード（module observer で捕捉）
+
+障害と対策（`FINDINGS.md` 詳細）:
+- 音声中の frida attach は SIGSEGV → アイドル attach + observer + 遅延フックで回避
+- APK 埋込 XOM lib で frida の module.base が幻アドレス → **dlopen(RTLD_NOLOAD)+dlsym** で解決
+  （`re/frida_krisp_dlsym.py`）
+
+残（ライブ確認・実機 VC 参加と同期が必要）:
+- [ ] 実際に呼ばれる関数の確定（素/WithStats、int16/float）
+- [ ] out=x3 サイン波注入 → 別端末で可聴か（注入点の最終確定）
