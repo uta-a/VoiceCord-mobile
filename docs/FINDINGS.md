@@ -31,6 +31,16 @@ opus は libdiscord.so に静的リンク・strip 済みで、Krisp 経路が圧
   重い列挙(`enumerateExports/Symbols`)は避ける（これもクラッシュ要因）。フック設置は
   ロード直後を避け 2〜2.5秒遅延させると安定。
 
+### 3.【決定的】frida-gadget は隔離名前空間にロードされ dlsym が届かない
+- LSPatch は gadget を `isolated ns clns-7` にロードする（logcat: `Load .../libgadget.so using isolated ns`）。
+- そのため gadget の `dlopen("libkrisp_wrapper.so", RTLD_NOLOAD)` は常に NULL
+  （Discord 本体の名前空間にある lib を隔離名前空間から解決できない）。
+- module observer は krisp ロードを検知できるが、アドレス解決手段が全滅:
+  findExportByName / getGlobalExportByName / enumerateExports(クラッシュ) / base+offset(幻address) / dlsym(名前空間) / maps(XOM匿名でコード領域が追えず)。
+- **結論: この端末(Android XOM + APK埋込lib + 隔離ns)では frida-gadget 経由のライブ注入は不可。**
+  ただしフェーズ1の本番方式（ShadowHook を Discord 自身の名前空間で動かす in-process 実装）は
+  アプリのリンカで解決・inline hook するため、この問題は発生しない見込み。
+
 ### 2. APK 埋込 XOM ライブラリで frida の module.base が誤検出（幻のアドレス）
 - 症状: `libkrisp_wrapper.so` は APK 内非圧縮(offset 0x1b98000)から直接 mmap されるが、
   frida の `module.base` が /proc/self/maps に存在しないアドレスを返し、

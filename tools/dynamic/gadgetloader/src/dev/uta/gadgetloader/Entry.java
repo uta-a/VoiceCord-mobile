@@ -37,8 +37,10 @@ public class Entry implements IXposedHookLoadPackage {
 
             File so = new File(base, "libgadget.so");
             File cfg = new File(base, "libgadget.config.so");
+            File agent = new File(base, "krisp_agent.js");
             extract(apkPath, "assets/libgadget.so", so);
             extract(apkPath, "assets/libgadget.config.so", cfg);
+            extract(apkPath, "assets/krisp_agent.js", agent);
 
             System.load(so.getAbsolutePath());
             XposedBridge.log("[gadgetloader] loaded " + so.getAbsolutePath());
