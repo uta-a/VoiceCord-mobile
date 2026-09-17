@@ -1,0 +1,18 @@
+{
+  "_readme": [
+    "Discord バージョンごとのバイトパターン。シンボルが strip されていて",
+    "名前で解決できないときのフォールバックに使う。",
+    "生成: python re/so_exports.py <lib/arm64-v8a> --emit-pattern opus_encode",
+    "選択: frida_*.py に --patterns signatures/patterns.json --discord-version <ver>",
+    "トップレベルのキーは Discord のバージョン文字列。1つしか無ければ自動で選ばれる。"
+  ],
+  "_example": {
+    "opus_encode": {
+      "module": "libdiscord_voice.so",
+      "bytes": "ff8300d1f44f01a9fd7b02a9",
+      "mask": "ffffffffffffffffffffffff",
+      "vaddr": "0x0",
+      "note": "これは書式例。実機から生成した値に差し替えること。"
+    }
+  }
+}

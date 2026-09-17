@@ -1,0 +1,4 @@
+# フェーズ0 調査ツールの依存
+frida-tools>=13.0.0   # frida 本体も入る
+pyelftools>=0.31      # .so(ELF) の静的解析
+capstone>=5.0.1       # 任意: --emit-pattern の逆アセンブル併記に使う
