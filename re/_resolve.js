@@ -4,7 +4,18 @@
 
 const OPUS_SYMS = ["opus_encode", "opus_encode_float", "opus_encoder_create",
                    "opus_encoder_ctl", "opus_encoder_init"];
-const KRISP_SYMS = ["KrispNCProcess", "KrispNCProcessFloat", "krisp_nc_process"];
+// Android の libkrisp_wrapper.so から実測したエクスポート(345.9 Stable)。
+// NC clean 系の第4引数(x3)が post-Krisp 出力バッファ。WithStats 版が本命候補。
+const KRISP_SYMS = [
+  "krispAudioNcWithStatsCleanAmbientNoiseInt16",
+  "krispAudioNcWithStatsCleanAmbientNoiseFloat",
+  "krispAudioNcCleanAmbientNoiseInt16",
+  "krispAudioNcCleanAmbientNoiseFloat",
+  "krispAudioNcWithStatsCleanAmbientNoiseWithRingtoneInt16",
+  "krispAudioNcCleanAmbientNoiseWithRingtoneInt16",
+  "KrispNCProcess",           // デスクトップ互換の高レベル thunk
+  "KrispNCProcessFloat",
+];
 const MODULE_HINTS = ["voice", "discord", "krisp", "opus", "webrtc", "audio", "octave"];
 
 function voiceModules() {

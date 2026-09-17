@@ -1,41 +1,78 @@
 # Android 版 discord ネイティブ RE — 解析ログ
 
-デスクトップ版 `../VoiceCord/ANALYSIS.md` の Android 版。フェーズ0の調査結果を
-ここに追記していく。**根拠と未確認範囲を必ず残すこと**（推測と実測を分ける）。
+デスクトップ版 `../VoiceCord/ANALYSIS.md` の Android 版。**根拠と未確認範囲を分けて残す**。
 
 ## 対象
 
 - パッケージ: `com.discord`（arm64-v8a、非root）
-- バージョン: __（`tools/pull_apk.sh` 実行時に記録）__
-- 取得日: __
+- バージョン: **345.9 - Stable**（versionCode=345009、minSdk=24 / targetSdk=36）
+- 取得日: 2026-09-17
+- 端末: arm64-v8a、user ビルド、**非root**（su/Magisk なし、Shizuku は ADB モード）
 
-## デスクトップ版からの引き継ぎ（確定事項・再調査不要）
+## デスクトップ版からの引き継ぎ（確定・再調査不要）
 
-- 送信音声はネイティブ完結（マイク→Krisp→Opus→RTP）。上位レイヤに PCM は出ない。
-- 他人へ任意音声を届ける唯一の経路は送信 RTP ストリーム。
+- 送信音声はネイティブ完結（マイク→Krisp→Opus→RTP）。他人へ届く唯一の経路は送信 RTP。
 - サウンドボード送信はサーバ側 API。クライアントに送信注入 API は非公開。
-- ローカル再生系（`StartSamplesLocalPlayback` 相当）は押下者にしか聞こえず送信されない。
-- デスクトップの確定注入点: `KrispNCProcessFloat`(float32) / `KrispNCProcess`(int16) の
-  第4引数=out=post-Krisp、第3引数=cnt=480、48kHz mono、約100Hz 連続。
+- デスクトップの確定注入点: `KrispNCProcessFloat`/`KrispNCProcess` の out 引数＝post-Krisp、
+  48kHz mono、480サンプル/frame、約100Hz 連続。
 
-## Android で未確認（フェーズ0で潰す）
+## 静的解析の結果（実測）
 
-- [ ] Krisp は独立 `.so` か、`libdiscord_voice`/WebRTC 等に内蔵か。エクスポート名は残るか。
-- [ ] 送信用 Opus エンコーダはどの `.so` にあるか。`opus_encode` シンボルは残るか。
-- [ ] 音声は別プロセス（`:voice` 等）か同一プロセスか（frida のアタッチ先）。
-- [ ] 呼び出し頻度（20ms=50/s か 10ms=100/s か）とフレーム長・チャンネル数。
-- [ ] ミュート／VAD 無音時にフック関数が呼ばれ続けるか。
-- [ ] 注入したサイン波が別端末で聞こえるか。opus / krisp どちらが成立するか。
-- [ ] 非root で frida-gadget によるネイティブフックが成立するか。
+### ライブラリ構成（`out/libs/`、43 個の .so）
 
-## 静的解析ログ
+- **`libkrisp_wrapper.so`**（Krisp が独立 .so。C++ シンボル 2898 個、`.dynsym` のみ）
+- **`libdiscord.so`**（ボイスエンジン本体。757 シンボル、`.dynsym` のみ）
+- `libreactnative.so` / `libhermesvm.so` ほか RN 系（音声とは無関係）
 
-（`elf_triage.py` / `so_exports.py` / `strings_grep.py` の結果を貼る）
+### 【確定】Krisp は独立 .so でクリーンな C API を持つ — `libkrisp_wrapper.so`
 
-## 動的解析ログ
+デスクトップ（`discord_krisp.node`）と同様、Krisp は独立していて、しかも
+**非マングルの C API がそのままエクスポート**されている（strip されていない）。
 
-（`frida_find.py` / `frida_cadence.py` / `frida_probe.py` の結果を貼る）
+注入点の第一候補（NC clean 系、int16/float 両方あり）:
 
-## 注入テスト結果
+| シンボル | 用途 |
+| --- | --- |
+| `krispAudioNcWithStatsCleanAmbientNoiseInt16` / `...Float` | NC + 統計。**本命**（Discord は noise 統計を表示するため） |
+| `krispAudioNcCleanAmbientNoiseInt16` / `...Float` | NC のみ |
+| `krispAudioNc(WithStats)CleanAmbientNoiseWithRingtone*` | 着信音考慮版 |
+| `KrispNCProcess` / `KrispNCProcessFloat` | デスクトップ互換の高レベル thunk（`b 0x163400`） |
 
-（`frida_inject.py` の結果と、別端末での可聴判定を貼る）
+標準 Krisp SDK の signature（実測の引数位置と一致）:
+```
+int krispAudioNcCleanAmbientNoiseInt16(
+    session,               // x0
+    const short* pFrameIn, // x1
+    unsigned  frameInSize, // x2 (= サンプル数, 48k/10ms なら 480)
+    short*    pFrameOut,   // x3  ← post-Krisp 出力。ここに加算する
+    unsigned  frameOutSize)// x4
+```
+→ **注入は out=args[3] へ加算**。デスクトップと同じ考え方で移植できる。
+
+関連 C API: `krispAudioGlobalInit/Destroy`、`krispAudioNc(WithStats)CreateSession/CloseSession`、
+`krispAudioNcWithStatsRetrieveStats`、VAD 系 `KrispVADProcess`/`krispAudioNoiseDbFrame*`、
+`krispAudioGetFrameEnergy*`（VAD/エネルギー判定に使える）。
+
+### 【確定】Opus/WebRTC は libdiscord.so に静的リンク・strip 済み
+
+- 独立 `libopus.so` は無い。libdiscord.so に **opus シンボルは1つも無い**（webrtc ごと静的リンク）。
+- ボイスは WebRTC 経由（`Java_org_webrtc_*` JNI 多数）＋ `com.discord.native.engine.NativeEngine`
+  （`createVoiceConnection`、`setOnVoiceCallback`、`setVoiceProcessingErrorCallback`）。
+- `opus_encode` を狙うにはパターンスキャンが必須で難度が高い。
+  → **Android では Krisp 経路が圧倒的に有利**（クリーンなエクスポートあり）。
+
+### libkrisp_wrapper.so の呼ばれ方
+
+- どの .so も `libkrisp_wrapper.so` を DT_NEEDED に持たない
+  → libdiscord.so が `dlopen`/`dlsym` で動的にロードして呼ぶ形と推定（要動的確認）。
+  フックはエクスポート名で解決できるため問題にならない。
+
+## 動的解析（未実施 — 非root のため frida-gadget 埋め込みが必要）
+
+frida-server は root 前提で使えない。次段では frida-gadget を LSPatch で Discord に
+同梱して観測する（Discord の再パック・再署名・再インストールを伴う）。
+
+- [ ] Discord が実際に呼ぶ Krisp 関数はどれか（WithStats 版か素の版か、int16 か float か）
+- [ ] 呼び出し頻度（480サンプル/10ms=100Hz を想定）とフレーム長・サンプルレート
+- [ ] ミュート／VAD 無音時に呼ばれ続けるか
+- [ ] out=args[3] にサイン波を加算 → 別端末で可聴か（注入点の最終確定）
