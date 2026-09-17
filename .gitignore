@@ -15,3 +15,12 @@ tools/dynamic/gadgetloader/assets/libgadget.so
 tools/dynamic/gadgetloader/build/
 tools/dynamic/out_patched/
 tools/dynamic/*.idsig
+
+# フェーズ1 native/module ビルド生成物
+native/build/
+tools/dynamic/voicecordmod/build/
+tools/dynamic/voicecordmod/lib/
+tools/dynamic/out_vc/
+tools/dynamic/shadowhook/extracted/
+tools/dynamic/shadowhook/*.aar
+tools/dynamic/*.idsig
