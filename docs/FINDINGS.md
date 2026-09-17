@@ -63,3 +63,38 @@ opus は libdiscord.so に静的リンク・strip 済みで、Krisp 経路が圧
 - LSPatch パッチ済み Discord は署名変更のみで正常動作（ログイン・VC 接続可）。MIUI の
   「USB経由でインストール」有効化が必要だった。
 - gadget config は listen + on_load:resume（起動をブロックしない）。
+
+---
+
+# フェーズ1 実機テストで判明した重大事項（2026-09-18）
+
+## post-Krisp 注入は再パック版 Discord では発火しない（Krisp が起動しない）
+
+ShadowHook 基盤は完璧に動作（init=0、krispAudioNcCleanAmbientNoiseInt16 / WithStats へ予約フック登録、
+VC 参加で krisp ロード検知）。**しかし clean 関数が一度も呼ばれない**。原因:
+
+- logcat: `PlayCore AssetPackServiceImpl: startDownload([krisp])` → `Finsky: startDownload() for com.discord`
+  → **`AssetPackServiceImpl: onError(-15)`**（-15 = **APP_NOT_OWNED**）→ `DiscordKrisp: Failed to load asset`
+  → `noise_canceller.cpp: Failed to load Krisp` → libkrisp_wrapper.so が即アンロード。
+- Krisp モデルは **Play Asset Delivery のオンデマンド配信**。LSPatch で再署名した Discord は
+  「Play で取得したアプリ」でないため、Play がアセットパックの配信を拒否する。
+- 手動配置も不可: Play Core の AssetPackManager は所有権＋自前セッション状態で可用性を判定するため、
+  モデル file を置いても `getPackLocation()` が有効を返さない（調査で確認、確度高）。
+
+→ **再パック(LSPatch)版では Krisp NC が構造的に起動しない。post-Krisp 注入は成立しない。**
+
+## 方針転換: Opus エンコーダ入口へ注入（設計書 優先1、ユーザー承認済み）
+
+送信経路は Krisp の有無に関わらず常に通る（capture→APM→**opus encode**→RTP）。Krisp 非依存の
+`WebRtcOpus_Encode`（送信 PCM = 第2引数 int16）または `opus_encode` に注入点を移す。
+
+- opus は libdiscord.so に static リンク・strip 済み → 名前解決不可。**RVA（base+offset）でフック**。
+- 実行時 base: エクスポート済み JNI シンボル
+  `Java_org_webrtc_BuiltinAudioEncoderFactoryFactory_nativeCreateBuiltinAudioEncoderFactory`
+  （dynsym RVA 0x9d39ec）から算出 → `base = 実行時addr − 0x9d39ec`、以降 `base + <opus関数RVA>`。
+- RVA は Ghidra の文字列 xref から導出し、Discord バージョン別に `signatures/` で管理。
+- ShadowHook 基盤（voicecordmod / native/src/hook.cpp）はフック対象を差し替えるだけで流用可。
+
+### この方式の利点
+- 再パック版でも動く（Krisp/Play 非依存）。
+- opus 入口は AGC 等も通過した最終段 → 注入音の音量が後処理で変わらない。
