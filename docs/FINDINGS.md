@@ -117,3 +117,59 @@ native SPSCリングバッファ→intercept pre で送信PCMに合成、を実�
 → token を知る同一端末上のアプリ/adb 実行者が、Discord が読めるパスの音声を送信音声に
    混入できる。**フェーズ3のコンパニオンで FileProvider(content:// + grantUriPermission)、
    getSentFromPackage() + 署名一致、authority 検証を実装して閉じる。**
+
+---
+
+# サウンドボード / Nitro / OTA 調査(2026-09-18)
+
+サウンドボード音源の取得可否と、Nitro ロック除去の可否を調査した。結論として、
+**音源取得は無認証で可能・注入経路で再生可能(案B)**、一方で **Nitro ロック(UI)除去は
+再パック非依存の手段が無く断念** した。
+
+## 1. サウンドボード音源は CDN 無認証で取得可能
+
+- URL: `https://cdn.discordapp.com/soundboard-sounds/<sound_id>`。形式は MP3 または Ogg
+  (`Content-Type: audio/mpeg` / `audio/ogg`)。**認証不要(公開配信)**。
+  - 出典: Discord 公式 Soundboard Docs
+    (https://docs.discord.com/developers/resources/soundboard)。
+  - 出典: 兄弟デスクトップ版 `VoiceCord-module/src/patcher/soundboardCache.ts` が
+    無認証 https で取得成功しているコード。
+- sound_id の入手元: REST `GET /guilds/{id}/soundboard-sounds`・
+  `GET /soundboard-default-sounds`、Gateway `Voice Channel Effect Send` 等。
+- 含意: 他サーバーのサウンドボード音でも sound_id さえ分かれば取得でき、**VoiceCord の
+  注入経路で流せば Nitro ゲートを通さず再生できる**(`ACTION_PLAY_SB` として実装=案B)。
+  MP3/Ogg(Opus/Vorbis)は現行 MediaExtractor+MediaCodec 経路でデコード可
+  (Android 公式対応表)。
+
+## 2. サウンドボードの Nitro ロックは Hermes(JS)層のみに存在
+
+- ロック判定 `canUseSoundboardEverywhere` /
+  `modules/soundboard/native/utils/useSoundboardSoundLock.tsx` / アップセル
+  `PremiumUpsellActionSheet` は全て `assets/index.android.bundle`(Hermes バイトコード
+  HBC v98)内の文字列として存在。
+- `libdiscord.so`・その他 .so・dex・Java 層には
+  soundboard/premiumType/canUseSoundboard/entitlement/nitro のゲートは**存在しない**
+  (全 so/dex 走査で 0 ヒット)。
+- 含意: **Xposed(Java フック)でも native フックでもロック除去は不可**。手段は HBC
+  バイトコード改変 / Hermes VM フック / データ注入のいずれかで、いずれも高難度。
+
+## 3. アプリは OTA バンドルを実行(APK 内バンドルではない)
+
+- `BundleUpdater.xml` の `key_android_js_bundle` =
+  `/data/user/0/com.discord/files/otas/<hash>/app/src/main/assets/index.android.bundle`
+  (約 54.7MB, ota_version=345.9)を実行。
+- 含意: **APK 内 index.android.bundle を改変しても無意味**(実行されない)。バンドル改変系は
+  OTA バンドルを対象にし、かつ OTA 無効化・e_tag 整合が要り極めて脆い。
+
+## 4. premiumType のクライアント側 override 単独では Nitro ロックは外れない(write-test 結果)
+
+- `shared_prefs/CacheStore.xml` の Flux 永続ストア `OverridePremiumTypeStore`
+  (`premiumTypeActual`)に `2`(Nitro)を書いて再起動する write-test を実施
+  (force-stop→書換→再起動→UI 確認→null 復帰、可逆・実施済み)。
+- 結果: **サウンドボード UI のロック(🔒バッジ・「Nitro を入手する」アップセル)は
+  書換前後で変化なし**。`canUseSoundboardEverywhere` は `premiumTypeActual` を単独では
+  参照していない。
+- 未検証の残手段: `perksActual.activePerksBitmask` への perk 投入、Hermes 層
+  `canUseSoundboardEverywhere` の直接改変。いずれも不確実 / 高難度(**未検証**)。
+- 方針: **Nitro ロック除去は断念**。サウンドボード再生目的は案B(CDN 取得→注入)で
+  達成済みのため、UI アンロックは不要と判断。
