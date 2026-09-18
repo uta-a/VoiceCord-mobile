@@ -13,6 +13,11 @@
 // データ経路: Java(CommandReceiver+MediaCodec)→ nativeWrite → リングバッファ(SPSC)
 //            → pre_encode(オーディオスレッド)で g_buf に加算 → x1 差し替え。
 //
+// 送信ゲート: Discord は毎フレーム ctrl=*(Connection*+0x10) の ctrl[0](送信デッドライン)で
+//   送信可否を決める。ctrl[0]=LLONG_MAX で VAD/Krisp を無視し常時送信、0 で通常 VAD。
+//   Connection* は Connection::GetStats(約1Hz)の x0 で捕捉し、DeliverRecordedData(約100Hz)を
+//   タイマにして再生中だけ ctrl[0] を再アサートする。旧方式(録音バッファへノイズ加算=keepAmp)は廃止。
+//
 // 実行時 base: エクスポート JNI(RVA 0x9d39ec)の実アドレス − 0x9d39ec。
 //   ※ RVA は Discord バージョン依存(345.9)。更新時は signatures/ で版別管理が必要。
 #include <jni.h>
@@ -32,10 +37,19 @@
 static const uintptr_t kAnchorRva = 0x9d39ec;  // nativeCreateBuiltinAudioEncoderFactory
 static const char *kAnchorSym = "Java_org_webrtc_BuiltinAudioEncoderFactoryFactory_nativeCreateBuiltinAudioEncoderFactory";
 static const uintptr_t kWebRtcOpusEncodeRva = 0x56b758;
+// AudioDeviceBuffer::DeliverRecordedData(録音funnel, ~100Hz)。録音バッファ加算はやめ、
+// これを 100Hz タイマとして使い、捕捉済み Connection* の ctrl[0] を再アサートする。
+static const uintptr_t kDeliverRecordedRva = 0x891618;  // AudioDeviceBuffer::DeliverRecordedData(~100Hz)
+static const uintptr_t kGetStatsRva = 0x392b18;  // Connection::GetStats(x0=Connection*, 約1Hz)
 
 static std::atomic<bool> g_inject{true};        // リングのミックスを行うか
 static std::atomic<int> g_calls{0};
+static std::atomic<int> g_scalls{0};
 static void *g_stub = nullptr;
+static void *g_stub_rec = nullptr;
+static void *g_stub_stats = nullptr;
+static std::atomic<uintptr_t> g_conn{0};        // 捕捉した Connection*
+static std::atomic<int> g_conn_ttl{0};          // 再アサート残フレーム(100Hz基準)。GetStatsで補充
 static std::atomic<float> g_gain{1.0f};         // sfx(注入音)の音量
 static std::atomic<float> g_duck{1.0f};         // mic(元音声)の音量
 
@@ -46,6 +60,47 @@ static Ring g_ring(480000);
 // 元 WebRtcOpus_Encode は pre 復帰後 g_buf を同期的に読み切って return する(Opus同期)。
 // TODO(フェーズ4): 複数エンコードスレッド対策で thread_local 化 + 版ズレガード + uninstall。
 static int16_t g_buf[8192];
+
+// Connection::GetStats(0x392b18, 約1Hz)の pre。x0=Connection* を捕捉して TTL を補充する。
+static void pre_getstats(shadowhook_cpu_context_t *ctx, void * /*data*/) {
+  uintptr_t conn = (uintptr_t)ctx->regs[0];
+  if (conn == 0) return;
+  if (g_scalls.load(std::memory_order_relaxed) < 3) {
+    LOG("GetStats call#%d conn=%p",
+        g_scalls.fetch_add(1, std::memory_order_relaxed), (void *)conn);
+  }
+  g_conn.store(conn, std::memory_order_relaxed);
+  // GetStats は約1Hz発火なので TTL=100(~1s @100Hz)でも接続中は枯れない。UAF窓を小さく保つ。
+  g_conn_ttl.store(100, std::memory_order_relaxed);
+}
+
+// 録音funnel AudioDeviceBuffer::DeliverRecordedData(0x891618, ~100Hz)の pre 割り込み。
+// 約100Hz。捕捉済み Connection* の送信ゲート(ctrl[0])を再生中だけ強制ONにし、
+// 停止時は「自分が立てた LLONG_MAX のときだけ」0(=通常VAD)へ戻す。
+// TTL: GetStats(約1Hz)が補充。VC切断で GetStats が止まると TTL が枯れ、
+//      解放済みかもしれない Connection* への書き込みを止める(安全弁)。
+//      ただし GetStats 停止と Connection 解放は非同期なので、TTL 幅(~1s)の
+//      UAF 窓は残る(切断直後の数フレームで解放済みポインタに触れる可能性)。
+//      根絶するには切断シグナルの捕捉が必要(フェーズ4)。
+// 前提: このフック(録音funnel)は単一スレッドから呼ばれる(pre_encode と同様)。
+//      よって g_conn_ttl の load→store(-1) の非アトミック RMW でも取りこぼしなし。
+// 既知の制限: PTTモードの端末では復帰時に PTT保持中の LLONG_MAX と区別できない
+//      (このデバイスはボイスアクティビティ運用前提)。
+static void pre_recorded(shadowhook_cpu_context_t * /*ctx*/, void * /*data*/) {
+  uintptr_t conn = g_conn.load(std::memory_order_relaxed);
+  int ttl = g_conn_ttl.load(std::memory_order_relaxed);
+  if (conn == 0 || ttl <= 0) return;
+  g_conn_ttl.store(ttl - 1, std::memory_order_relaxed);
+  long ctrl = *(long *)(conn + 0x10);
+  if (ctrl == 0) return;
+  volatile int64_t *deadline = (int64_t *)(ctrl + 0x0);
+  bool playing = g_inject.load(std::memory_order_relaxed) && g_ring.hasData();
+  if (playing) {
+    *deadline = 0x7fffffffffffffffLL;         // LLONG_MAX: 常時送信
+  } else if (*deadline == 0x7fffffffffffffffLL) {
+    *deadline = 0;                            // 自分が立てた分だけ通常VADへ復帰
+  }
+}
 
 // WebRtcOpus_Encode 入口の pre 割り込み。x1=audio_in, x2=samples。
 static void pre_encode(shadowhook_cpu_context_t *ctx, void * /*data*/) {
@@ -79,6 +134,18 @@ static void *install_thread(void *) {
                                                 SHADOWHOOK_INTERCEPT_DEFAULT);
         int e = shadowhook_get_errno();
         LOG("intercept WebRtcOpus_Encode stub=%p errno=%d (%s)", g_stub, e, shadowhook_to_errmsg(e));
+
+        void *rtarget = (void *)(base + kDeliverRecordedRva);
+        g_stub_rec = shadowhook_intercept_func_addr(rtarget, pre_recorded, nullptr,
+                                                    SHADOWHOOK_INTERCEPT_DEFAULT);
+        LOG("intercept DeliverRecordedData stub=%p errno=%d (%s)", g_stub_rec,
+            shadowhook_get_errno(), shadowhook_to_errmsg(shadowhook_get_errno()));
+
+        void *starget = (void *)(base + kGetStatsRva);
+        g_stub_stats = shadowhook_intercept_func_addr(starget, pre_getstats, nullptr,
+                                                      SHADOWHOOK_INTERCEPT_DEFAULT);
+        LOG("intercept GetStats stub=%p errno=%d (%s)", g_stub_stats,
+            shadowhook_get_errno(), shadowhook_to_errmsg(shadowhook_get_errno()));
         return nullptr;
       }
       LOG("anchor sym 未解決。リトライ");

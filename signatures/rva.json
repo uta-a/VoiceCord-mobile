@@ -20,7 +20,13 @@
       "funcs": {
         "WebRtcOpus_Encode": "0x56b758",
         "opus_encode": "0x5a975c",
-        "opus_multistream_encode": "0x5902f0"
+        "opus_multistream_encode": "0x5902f0",
+        "AudioDeviceBuffer::DeliverRecordedData": "0x891618",
+        "Connection::GetStats": "0x392b18"
+      },
+      "offsets": {
+        "connectionCtrlOffset": "0x10",
+        "connectionDeadlineOffset": "0x0"
       },
       "hook": {
         "target": "WebRtcOpus_Encode",
@@ -34,7 +40,7 @@
         "krispAudioNcCleanAmbientNoiseInt16_vaddr": "0x8c064"
       },
       "vad": {
-        "note": "Discord独自VAD(voice_activity_detector.cpp)が encode 後段で無音時の RTP 送出を抑制。再生中の送信継続はキャプチャキープアライブ(nativeDataIsRecorded RVA 0x9e3980 / nativeCacheDirectBufferAddress 0x9e38c4)で対応予定(未実装)。"
+        "note": "Discord独自VAD(voice_activity_detector.cpp)が encode 後段で無音時の RTP 送出を抑制。Connection::GetStats(0x392b18)の x0 で Connection* を捕捉し、ctrl=*(Connection*+connectionCtrlOffset) の ctrl[connectionDeadlineOffset](送信デッドライン int64)を LLONG_MAX にして再生中のみ送信強制、停止時は自分が立てた LLONG_MAX のみ 0 へ復帰(実装済み)。DeliverRecordedData を 100Hz タイマとして再アサート。keepAmp/ノイズ加算方式は廃止。"
       }
     }
   }
