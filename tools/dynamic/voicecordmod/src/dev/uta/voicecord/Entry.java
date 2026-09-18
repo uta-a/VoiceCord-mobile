@@ -73,6 +73,7 @@ public class Entry implements IXposedHookLoadPackage {
             try {
                 IntentFilter f = new IntentFilter();
                 f.addAction(CommandReceiver.ACTION_PLAY);
+                f.addAction(CommandReceiver.ACTION_PLAY_SB);
                 f.addAction(CommandReceiver.ACTION_STOP);
                 f.addAction(CommandReceiver.ACTION_SET);
                 f.addAction(CommandReceiver.ACTION_PING);

@@ -73,6 +73,9 @@ adb shell run-as com.discord cat /data/data/com.discord/cache/vc_token
 # VC 参加後、音声ファイルを再生(送信音声にミックスされる)
 adb shell am broadcast -a dev.uta.voicecord.PLAY -p com.discord \
   --es path /data/data/com.discord/cache/<file> --es token <token>
+# サウンドボード音源を sound_id から CDN 取得して再生(端末内取得, 案B)
+adb shell am broadcast -a dev.uta.voicecord.PLAY_SB -p com.discord \
+  --es sound_id <数字ID> --es token <token>
 # 停止
 adb shell am broadcast -a dev.uta.voicecord.STOP -p com.discord --es token <token>
 ```
@@ -80,5 +83,9 @@ adb shell am broadcast -a dev.uta.voicecord.STOP -p com.discord --es token <toke
 ## host 単体テスト（実機不要）
 
 ```bash
+# ネイティブ SPSC リング
 g++ -std=c++17 -O2 -pthread native/test/ring_test.cpp -I native/src -o ring_test && ./ring_test
+# サウンドボード ID 関門(ファイル冒頭のコンパイル手順に準拠)
+javac -d /tmp/sbtest tools/dynamic/voicecordmod/src/dev/uta/voicecord/SoundboardFetcher.java \
+  tools/dynamic/voicecordmod/test/SoundboardFetcherTest.java && java -cp /tmp/sbtest dev.uta.voicecord.SoundboardFetcherTest
 ```

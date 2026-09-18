@@ -9,6 +9,7 @@ import android.media.MediaFormat;
 
 import de.robv.android.xposed.XposedBridge;
 
+import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.ShortBuffer;
@@ -25,6 +26,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class CommandReceiver extends BroadcastReceiver {
 
     public static final String ACTION_PLAY = "dev.uta.voicecord.PLAY";
+    // 案B: sound_id から CDN 取得→キャッシュ→既存デコード経路で再生。任意パスではなく数字 ID のみ。
+    public static final String ACTION_PLAY_SB = "dev.uta.voicecord.PLAY_SB";
     public static final String ACTION_STOP = "dev.uta.voicecord.STOP";
     public static final String ACTION_SET = "dev.uta.voicecord.SET";
     public static final String ACTION_PING = "dev.uta.voicecord.PING";
@@ -68,6 +71,51 @@ public class CommandReceiver extends BroadcastReceiver {
             NativeBridge.nativeStop();          // 前の再生分をリングから捨てる
             Thread t = new Thread(new DecodeTask(path, myGen), "voicecord-decode");
             t.start();
+        } else if (ACTION_PLAY_SB.equals(action)) {
+            String soundId = intent.getStringExtra("sound_id");
+            float gain = intent.getFloatExtra("gain", 1.0f);
+            float duck = intent.getFloatExtra("duck", 1.0f);
+            // receiver 側でも一次検証(fetcher と二重でよい。数字 ID 以外を早期拒否)。
+            if (!SoundboardFetcher.isSoundId(soundId)) {
+                XposedBridge.log("[voicecord] PLAY_SB: sound_id の形が不正");
+                return;
+            }
+            NativeBridge.nativeSetParams(gain, duck);
+            int myGen = GEN.incrementAndGet();  // 旧デコードスレッドを終了させる
+            NativeBridge.nativeStop();          // 前の再生分をリングから捨てる
+            // onReceive はメインスレッドなので CDN 取得(ブロッキング)は必ず別スレッドで行う。
+            Thread t = new Thread(new FetchTask(context.getApplicationContext().getCacheDir(), soundId, myGen),
+                    "voicecord-sb-fetch");
+            t.start();
+        }
+    }
+
+    // sound_id を CDN 取得(ブロッキング)し、成功かつ世代一致なら DecodeTask を回す。
+    // 匿名クラスは d8 8.2.2 でクラッシュするため名前付き Runnable にする。
+    static final class FetchTask implements Runnable {
+        private final File cacheDir;
+        private final String soundId;
+        private final int gen;  // 自分の再生世代。GEN と不一致になったら破棄する。
+
+        FetchTask(File cacheDir, String soundId, int gen) {
+            this.cacheDir = cacheDir;
+            this.soundId = soundId;
+            this.gen = gen;
+        }
+
+        @Override
+        public void run() {
+            File f = SoundboardFetcher.fetch(cacheDir, soundId);
+            if (f == null) {
+                XposedBridge.log("[voicecord] PLAY_SB: 取得失敗 id=" + soundId);
+                return;
+            }
+            if (GEN.get() != gen) {  // 取得中に STOP / 新 PLAY が来ていたら再生しない
+                XposedBridge.log("[voicecord] PLAY_SB: gen 不一致で破棄");
+                return;
+            }
+            // 取得済みキャッシュを既存デコード経路へそのまま流す。
+            new DecodeTask(f.getAbsolutePath(), gen).run();
         }
     }
 
