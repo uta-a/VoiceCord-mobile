@@ -5,6 +5,7 @@ apk/
 *.log
 __pycache__/
 .venv/
+.vscode/
 
 # 動的解析の生成物・大容量バイナリ
 tools/dynamic/*.jar
