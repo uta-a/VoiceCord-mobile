@@ -79,9 +79,13 @@ public class Entry implements IXposedHookLoadPackage {
                 XposedBridge.log("[voicecord] versionCode 取得失敗、フック無効化");
             }
             try {
+                // 全アクション data 無しの Intent で送られる(PLAY_URI も URI を文字列 extra で渡す)。
+                // data URI 付きブロードキャストは runtime レシーバに確実に配送されないため、
+                // 送信側は setData を使わず、権限は grantUriPermission で uid 単位に明示付与する。
                 IntentFilter f = new IntentFilter();
                 f.addAction(CommandReceiver.ACTION_PLAY);
                 f.addAction(CommandReceiver.ACTION_PLAY_SB);
+                f.addAction(CommandReceiver.ACTION_PLAY_URI);
                 f.addAction(CommandReceiver.ACTION_STOP);
                 f.addAction(CommandReceiver.ACTION_SET);
                 f.addAction(CommandReceiver.ACTION_PING);

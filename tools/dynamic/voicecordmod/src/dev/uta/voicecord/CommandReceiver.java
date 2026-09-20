@@ -28,6 +28,10 @@ public class CommandReceiver extends BroadcastReceiver {
     public static final String ACTION_PLAY = "dev.uta.voicecord.PLAY";
     // 案B: sound_id から CDN 取得→キャッシュ→既存デコード経路で再生。任意パスではなく数字 ID のみ。
     public static final String ACTION_PLAY_SB = "dev.uta.voicecord.PLAY_SB";
+    // フェーズ3拡張: コンパニオンが SAF で選んだ content:// を一時読み取り権限付きで受け再生。
+    // Intent.getData() の URI を FLAG_GRANT_READ_URI_PERMISSION 付きで受け取り、権限が有効な
+    // onReceive 内で MediaExtractor を開いてから(=fd 確保)デコードスレッドへ渡す。
+    public static final String ACTION_PLAY_URI = "dev.uta.voicecord.PLAY_URI";
     public static final String ACTION_STOP = "dev.uta.voicecord.STOP";
     public static final String ACTION_SET = "dev.uta.voicecord.SET";
     public static final String ACTION_PING = "dev.uta.voicecord.PING";
@@ -71,7 +75,10 @@ public class CommandReceiver extends BroadcastReceiver {
             float duck = intent.getFloatExtra("duck", 1.0f);
             NativeBridge.nativeSetParams(gain, duck);
         } else if (ACTION_PING.equals(action)) {
-            XposedBridge.log("[voicecord] state=" + NativeBridge.nativeState());
+            int state = NativeBridge.nativeState();
+            XposedBridge.log("[voicecord] state=" + state);
+            // コンパニオンが順序付きで PING したら state を結果データで返す(UI 表示用)。
+            if (isOrderedBroadcast()) setResultData(String.valueOf(state));
         } else if (ACTION_PLAY.equals(action)) {
             String path = intent.getStringExtra("path");
             float gain = intent.getFloatExtra("gain", 1.0f);
@@ -101,6 +108,53 @@ public class CommandReceiver extends BroadcastReceiver {
             Thread t = new Thread(new FetchTask(context.getApplicationContext().getCacheDir(), soundId, myGen),
                     "voicecord-sb-fetch");
             t.start();
+        } else if (ACTION_PLAY_URI.equals(action)) {
+            // ファイル再生はコンパニオンが 127.0.0.1 に立てた待受から取得する
+            // (SAF/ContentProvider は package visibility 等で Discord から読めない。docs/FINDINGS.md)。
+            // uri は http://127.0.0.1:PORT/<token> 形式の文字列 extra。
+            String uriStr = intent.getStringExtra("uri");
+            float gain = intent.getFloatExtra("gain", 1.0f);
+            float duck = intent.getFloatExtra("duck", 1.0f);
+            if (!LocalFetcher.isLocalUrl(uriStr)) {
+                XposedBridge.log("[voicecord] PLAY_URI: localhost URL でない(拒否)");
+                return;
+            }
+            NativeBridge.nativeSetParams(gain, duck);
+            int myGen = GEN.incrementAndGet();  // 旧デコードスレッドを終了させる
+            NativeBridge.nativeStop();          // 前の再生分をリングから捨てる
+            // onReceive はメインスレッドなので取得(ブロッキング)は必ず別スレッドで行う。
+            Thread t = new Thread(
+                    new LocalFetchTask(context.getApplicationContext().getCacheDir(), uriStr, myGen),
+                    "voicecord-local-fetch");
+            t.start();
+        }
+    }
+
+    // localhost 待受から取得(ブロッキング)し、成功かつ世代一致なら DecodeTask を回す。
+    // 匿名クラスは d8 8.2.2 でクラッシュするため名前付き Runnable にする。
+    static final class LocalFetchTask implements Runnable {
+        private final File cacheDir;
+        private final String url;
+        private final int gen;
+
+        LocalFetchTask(File cacheDir, String url, int gen) {
+            this.cacheDir = cacheDir;
+            this.url = url;
+            this.gen = gen;
+        }
+
+        @Override
+        public void run() {
+            File f = LocalFetcher.fetch(cacheDir, url);
+            if (f == null) {
+                XposedBridge.log("[voicecord] PLAY_URI: localhost 取得失敗");
+                return;
+            }
+            if (GEN.get() != gen) {  // 取得中に STOP / 新 PLAY が来ていたら再生しない
+                XposedBridge.log("[voicecord] PLAY_URI: gen 不一致で破棄");
+                return;
+            }
+            new DecodeTask(f.getAbsolutePath(), gen).run();
         }
     }
 
