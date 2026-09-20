@@ -542,13 +542,15 @@ public class MainActivity extends Activity
     }
 
     // 1件をリストへ足すだけ(保存/再描画/トーストは呼び出し側でまとめて行う)。
-    // 既に同じ URI があれば false(重複スキップ)。
+    // 重複は除外して false: 同じ URI、または同名(別 URI でも同じファイル扱い。Recent/Downloads 等で
+    // URI が変わっても重複追加させない)。
     private boolean addOne(Uri uri) {
-        for (FileEntry e : files) {
-            if (e.uri.equals(uri)) return false;
-        }
         String name = queryDisplayName(uri);
         if (name == null || name.isEmpty()) name = uri.getLastPathSegment();
+        for (FileEntry e : files) {
+            if (e.uri.equals(uri)) return false;                        // 同一 URI
+            if (name != null && name.equalsIgnoreCase(e.name)) return false;  // 同名は重複扱い
+        }
         files.add(0, new FileEntry(uri, name));
         return true;
     }
