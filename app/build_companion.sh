@@ -37,7 +37,9 @@ echo "[5/6] zipalign"
 "$BT/zipalign.exe" -f 4 "$BUILD/base.apk" "$BUILD/aligned.apk"
 
 echo "[6/6] 署名(デバッグ鍵)"
-KS="$BUILD/debug.keystore"
+# 鍵は build/ の外に置いて永続化する(build/ は毎回消すため、ここに置くと毎回鍵が変わり
+# 署名不一致で -r 更新できなくなる)。
+KS="debug.keystore"
 if [ ! -f "$KS" ]; then
   "$KT" -genkeypair -keystore "$KS" -alias key0 -storepass 123456 -keypass 123456 \
     -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=VoiceCord Companion Debug" >/dev/null 2>&1

@@ -29,3 +29,4 @@ tools/dynamic/*.idsig
 # フェーズ3 コンパニオン(app/)ビルド生成物
 app/build/
 app/*.idsig
+app/debug.keystore

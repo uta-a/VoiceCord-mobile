@@ -5,7 +5,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.uta.voicecordcompanion">
 
-    <!-- インターネット等の危険権限は不要。すべて同一端末内のブロードキャストのみ。 -->
+    <!-- ファイル再生用の localhost 待受(127.0.0.1)にソケットを bind するため INTERNET が要る。
+         外部通信はせず、待受はループバックのみ(端末外から到達不可)。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:label="VoiceCord Companion"
