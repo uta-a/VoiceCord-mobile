@@ -70,6 +70,16 @@ public class Entry implements IXposedHookLoadPackage {
                 XposedBridge.log("[voicecord] Context 取得失敗、レシーバ未登録");
                 return;
             }
+            // versionCode を native へ通知(対応版でなければ native 側で版ズレガードがフックを無効化する)。
+            try {
+                long vc = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).getLongVersionCode();
+                // (int) は下位32bit(=versionCode本体)を保持。versionCodeMajor は上位で今回対象外。
+                NativeBridge.nativeSetVersion((int) vc);
+                XposedBridge.log("[voicecord] versionCode=" + vc + " を native へ通知");
+            } catch (Throwable e) {
+                NativeBridge.nativeSetVersion(-1);  // 取得失敗は不明扱い→native側でフック無効化
+                XposedBridge.log("[voicecord] versionCode 取得失敗、フック無効化");
+            }
             try {
                 IntentFilter f = new IntentFilter();
                 f.addAction(CommandReceiver.ACTION_PLAY);

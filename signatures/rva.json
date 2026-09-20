@@ -2,7 +2,8 @@
   "_readme": [
     "libdiscord.so 内の非エクスポート関数の RVA を Discord バージョン別に管理する。",
     "現状これらの値は native/src/hook.cpp にハードコードされている(345.9)。",
-    "フェーズ4でこの表から読み込み、未対応バージョンは検出してフックを無効化する予定。",
+    "版ズレガードは hook.cpp の kExpectedVersionCode(=この表の versionCode 345009)で実装済み。実行時 versionCode と不一致/不明ならフックを張らない。",
+    "RVA 値自体は現状 hook.cpp のコンパイル時定数で、この表は人間向けの版別レジストリ。",
     "実行時アドレス = base + rva。base = (anchor の実行時アドレス) - anchor.rva。",
     "anchor はエクスポート済み JNI シンボルで dlsym/ShadowHook で解決できる。",
     "RVA 更新手順: Ghidra で libdiscord.so を解析し、anchor 基準(ImageBase 0x100000)で導出。"
@@ -22,7 +23,8 @@
         "opus_encode": "0x5a975c",
         "opus_multistream_encode": "0x5902f0",
         "AudioDeviceBuffer::DeliverRecordedData": "0x891618",
-        "Connection::GetStats": "0x392b18"
+        "Connection::GetStats": "0x392b18",
+        "NativeConnection_nativeDestroyInstance": "0x3c2fa8"
       },
       "offsets": {
         "connectionCtrlOffset": "0x10",

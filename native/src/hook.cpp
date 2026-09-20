@@ -41,6 +41,11 @@ static const uintptr_t kWebRtcOpusEncodeRva = 0x56b758;
 // これを 100Hz タイマとして使い、捕捉済み Connection* の ctrl[0] を再アサートする。
 static const uintptr_t kDeliverRecordedRva = 0x891618;  // AudioDeviceBuffer::DeliverRecordedData(~100Hz)
 static const uintptr_t kGetStatsRva = 0x392b18;  // Connection::GetStats(x0=Connection*, 約1Hz)
+// VC切断で Java 側が呼ぶ Connection 破棄 JNI(エクスポート済み=dlsymで解決、版に強い)。
+// これを pre で捕まえ、解放前に g_conn を無効化して 100Hz 側の解放済みポインタ触読(UAF)を根絶する。
+static const char *kDestroySym = "Java_com_discord_native_engine_NativeConnection_nativeDestroyInstance";  // RVA 参考 0x3c2fa8
+static const int kExpectedVersionCode = 345009;  // 対応 Discord versionCode(345.9)
+static std::atomic<int> g_version{-1};           // Java から通知される versionCode(-1=未設定)
 
 static std::atomic<bool> g_inject{true};        // リングのミックスを行うか
 static std::atomic<int> g_calls{0};
@@ -48,6 +53,7 @@ static std::atomic<int> g_scalls{0};
 static void *g_stub = nullptr;
 static void *g_stub_rec = nullptr;
 static void *g_stub_stats = nullptr;
+static void *g_stub_destroy = nullptr;
 static std::atomic<uintptr_t> g_conn{0};        // 捕捉した Connection*
 static std::atomic<int> g_conn_ttl{0};          // 再アサート残フレーム(100Hz基準)。GetStatsで補充
 static std::atomic<float> g_gain{1.0f};         // sfx(注入音)の音量
@@ -56,10 +62,21 @@ static std::atomic<float> g_duck{1.0f};         // mic(元音声)の音量
 // SPSC リングバッファ(約10秒 @48kHz mono)。実装は ring.h。host 単体テストあり。
 static Ring g_ring(480000);
 
-// 差し替え用の書込可能バッファ。前提(フェーズ1と同じ): 送信オーディオスレッドは単一、
-// 元 WebRtcOpus_Encode は pre 復帰後 g_buf を同期的に読み切って return する(Opus同期)。
-// TODO(フェーズ4): 複数エンコードスレッド対策で thread_local 化 + 版ズレガード + uninstall。
-static int16_t g_buf[8192];
+// 差し替え用の書込可能バッファ。thread_local により、複数のエンコードスレッドが並行しても
+// 各スレッド専用バッファになり競合しない。元 WebRtcOpus_Encode は pre 復帰後 g_buf を同期的に
+// 読み切って return する(Opus同期)ため、スタックローカルでは寿命が足りず、per-thread の
+// 永続バッファが必要。
+// TODO(フェーズ4): uninstall(フック解除)対応。
+static thread_local int16_t g_buf[8192];
+
+// NativeConnection_nativeDestroyInstance の pre。VC切断で Connection が破棄される直前に呼ばれる。
+// 破棄より前に g_conn/ttl を無効化し、以後の 100Hz 再アサートが解放済みポインタに触れないようにする
+// (UAF根絶)。同時に保持する voice Connection は1本のため無条件クリアで実害なし(送信ゲート強制が
+// 破棄直前にわずかに早く切れるだけ)。エクスポート済みシンボルを dlsym で解決するため版に強い。
+static void pre_destroy(shadowhook_cpu_context_t * /*ctx*/, void * /*data*/) {
+  g_conn.store(0, std::memory_order_relaxed);
+  g_conn_ttl.store(0, std::memory_order_relaxed);
+}
 
 // Connection::GetStats(0x392b18, 約1Hz)の pre。x0=Connection* を捕捉して TTL を補充する。
 static void pre_getstats(shadowhook_cpu_context_t *ctx, void * /*data*/) {
@@ -80,8 +97,8 @@ static void pre_getstats(shadowhook_cpu_context_t *ctx, void * /*data*/) {
 // TTL: GetStats(約1Hz)が補充。VC切断で GetStats が止まると TTL が枯れ、
 //      解放済みかもしれない Connection* への書き込みを止める(安全弁)。
 //      ただし GetStats 停止と Connection 解放は非同期なので、TTL 幅(~1s)の
-//      UAF 窓は残る(切断直後の数フレームで解放済みポインタに触れる可能性)。
-//      根絶するには切断シグナルの捕捉が必要(フェーズ4)。
+//      UAF 窓は残るが、nativeDestroyInstance(pre_destroy)で破棄直前に g_conn を
+//      0 化するため、通常の VC 切断ではこの窓に入らない(TTL は保険として残す)。
 // 前提: このフック(録音funnel)は単一スレッドから呼ばれる(pre_encode と同様)。
 //      よって g_conn_ttl の load→store(-1) の非アトミック RMW でも取りこぼしなし。
 // 既知の制限: PTTモードの端末では復帰時に PTT保持中の LLONG_MAX と区別できない
@@ -125,9 +142,24 @@ static void *install_thread(void *) {
     void *h = shadowhook_dlopen("libdiscord.so");
     if (h != nullptr) {
       void *anchor = shadowhook_dlsym(h, kAnchorSym);
+      void *destroy = shadowhook_dlsym(h, kDestroySym);  // 破棄JNI(dlsym解決=版に強い)
       shadowhook_dlclose(h);
       if (anchor != nullptr) {
         uintptr_t base = (uintptr_t)anchor - kAnchorRva;
+
+        // 版ズレガード: versionCode 通知を待ち、対応版でなければフックしない(誤オフセットでのクラッシュ防止)。
+        int vc = -1;
+        for (int w = 0; w < 120; w++) {            // 最大 ~60s 待つ
+          vc = g_version.load(std::memory_order_relaxed);
+          if (vc >= 0) break;
+          usleep(500 * 1000);
+        }
+        if (vc != kExpectedVersionCode) {
+          LOG("版ズレ: expected=%d actual=%d → フック無効化", kExpectedVersionCode, vc);
+          return nullptr;
+        }
+        LOG("版一致: versionCode=%d", vc);
+
         void *target = (void *)(base + kWebRtcOpusEncodeRva);
         LOG("libdiscord base=%p target(WebRtcOpus_Encode)=%p", (void *)base, target);
         g_stub = shadowhook_intercept_func_addr(target, pre_encode, nullptr,
@@ -146,6 +178,16 @@ static void *install_thread(void *) {
                                                       SHADOWHOOK_INTERCEPT_DEFAULT);
         LOG("intercept GetStats stub=%p errno=%d (%s)", g_stub_stats,
             shadowhook_get_errno(), shadowhook_to_errmsg(shadowhook_get_errno()));
+
+        // UAF根絶: Connection 破棄 JNI を pre で捕まえて g_conn を無効化する。
+        if (destroy != nullptr) {
+          g_stub_destroy = shadowhook_intercept_func_addr(destroy, pre_destroy, nullptr,
+                                                          SHADOWHOOK_INTERCEPT_DEFAULT);
+          LOG("intercept nativeDestroyInstance stub=%p errno=%d (%s)", g_stub_destroy,
+              shadowhook_get_errno(), shadowhook_to_errmsg(shadowhook_get_errno()));
+        } else {
+          LOG("nativeDestroyInstance 未解決(UAF根絶フックはスキップ)");
+        }
         return nullptr;
       }
       LOG("anchor sym 未解決。リトライ");
@@ -166,6 +208,13 @@ Java_dev_uta_voicecord_NativeBridge_nativeInit(JNIEnv *, jclass) {
   }
   pthread_detach(t);
   return 0;
+}
+
+// Java から Discord の versionCode を通知する。対応版判定は install_thread の版ズレガードで行う。
+extern "C" JNIEXPORT void JNICALL
+Java_dev_uta_voicecord_NativeBridge_nativeSetVersion(JNIEnv *, jclass, jint code) {
+  g_version.store(code, std::memory_order_relaxed);
+  LOG("versionCode set=%d", (int)code);
 }
 
 extern "C" JNIEXPORT void JNICALL

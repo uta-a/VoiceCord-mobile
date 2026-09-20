@@ -3,6 +3,7 @@ package dev.uta.voicecord;
 // libvoicecord.so への JNI ブリッジ。実体は native/src/hook.cpp。
 public class NativeBridge {
     public static native int nativeInit();               // 0=OK, 負値=失敗
+    public static native void nativeSetVersion(int versionCode);  // 対応版判定用に versionCode を通知
     public static native void nativeSetInject(boolean on);
 
     // フェーズ2: 48kHz/int16/mono の PCM をリングへ投入(書けたサンプル数)。
