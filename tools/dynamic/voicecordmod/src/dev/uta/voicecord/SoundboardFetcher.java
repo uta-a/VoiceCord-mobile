@@ -41,6 +41,10 @@ public final class SoundboardFetcher {
     private static final String CDN_HOST = "cdn.discordapp.com";
     private static final int MAX_BYTES = 8 * 1024 * 1024;   // 8MB 上限
     private static final int TIMEOUT_MS = 10_000;           // connect/read 各 10 秒
+    // キャッシュ eviction 上限。取得成功のたびに vc_sb_* を古い順で上限内へ収める。
+    // (host テストが default パッケージから参照するため public。)
+    public static final int MAX_CACHE_FILES = 32;                  // vc_sb_* の最大件数
+    public static final long MAX_CACHE_BYTES = 64L * 1024 * 1024;  // vc_sb_* の総バイト上限(64MB)
     // 同一 sound_id を並行取得しても .tmp が衝突しないよう呼び出しごとに一意な連番を付ける。
     private static final AtomicInteger TMP_SEQ = new AtomicInteger();
 
@@ -146,6 +150,7 @@ public final class SoundboardFetcher {
                 return null;
             }
             XposedBridge.log("[voicecord] SB: 取得完了 id=" + id + " ext=" + ext + " bytes=" + received);
+            evictCache(cacheDir);  // 上限超過分の古いキャッシュを整理(finalFile は最新なので残る)
             return finalFile;
         } catch (Throwable e) {
             XposedBridge.log("[voicecord] SB: 取得失敗:");
@@ -168,6 +173,49 @@ public final class SoundboardFetcher {
         if ("audio/mpeg".equals(type)) return "mp3";
         if ("audio/ogg".equals(type)) return "ogg";
         return null;
+    }
+
+    /**
+     * cacheDir 内の vc_sb_* を列挙し、件数上限(MAX_CACHE_FILES)または総バイト上限
+     * (MAX_CACHE_BYTES)を超えていたら lastModified 昇順(古い順=LRU 近似)に削除して
+     * 上限内へ収める。vc_sb_ で始まるファイルのみ対象(vc_token 等 他は触らない)。
+     * 直前に確定した finalFile は最新のため最後まで残る。例外は握って無視(eviction 失敗は致命的でない)。
+     * (host テストが default パッケージから参照するため public。)
+     */
+    public static void evictCache(File cacheDir) {
+        try {
+            File[] files = cacheDir.listFiles();
+            if (files == null) return;
+            // vc_sb_ で始まる確定ファイルのみ対象(vc_token 等は触らない)。
+            // 取得中/残骸の .tmp は除外(並行取得中の .tmp を消すと renameTo が失敗するため)。
+            // Comparator/List.sort は d8 8.2.2 でクラッシュするため、File[] + 手動の最古選択で回す
+            // (対象は上限+数件と小さいので単純な線形選択で十分)。
+            File[] sb = new File[files.length];
+            int count = 0;
+            long total = 0;
+            for (File f : files) {
+                if (f.isFile() && f.getName().startsWith("vc_sb_") && !f.getName().endsWith(".tmp")) {
+                    sb[count++] = f;
+                    total += f.length();
+                }
+            }
+            // 上限超過の間、最古(lastModified 最小)を1件ずつ削除。上限内で止めるので最新の finalFile は残る。
+            while (count > MAX_CACHE_FILES || total > MAX_CACHE_BYTES) {
+                int oldest = -1;
+                long oldestMtime = Long.MAX_VALUE;
+                for (int i = 0; i < sb.length; i++) {
+                    if (sb[i] == null) continue;
+                    long m = sb[i].lastModified();
+                    if (m < oldestMtime) { oldestMtime = m; oldest = i; }
+                }
+                if (oldest < 0) break;  // 対象が尽きた(安全弁)
+                long len = sb[oldest].length();
+                if (sb[oldest].delete()) { total -= len; count--; }
+                sb[oldest] = null;  // 試行済みは外す(削除失敗でも無限ループにしない)
+            }
+        } catch (Throwable ignore) {
+            // eviction 失敗は致命的でない(握って無視)。
+        }
     }
 
     private static void deleteQuietly(File f) {
