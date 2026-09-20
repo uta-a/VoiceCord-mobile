@@ -29,6 +29,8 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.InputStream;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -72,12 +74,21 @@ public class MainActivity extends Activity
     private final List<FileEntry> files = new ArrayList<>();  // 音源リスト(ワンタップ再生)
     private LocalFileServer server;  // ファイル再生用の 127.0.0.1 待受(遅延起動)。
 
-    // 音源リストの1件(SAF の URI と表示名)。永続 URI 権限を持つ前提。
+    // 音源リストの1件(SAF の URI と表示名、重複判定用の指紋)。永続 URI 権限を持つ前提。
+    // fingerprint = "<size>:<先頭HASH_BYTESのSHA-1(hex)>"。取得失敗時は null(URI一致のみで判定)。
     static final class FileEntry {
         final Uri uri;
         final String name;
-        FileEntry(Uri uri, String name) { this.uri = uri; this.name = name; }
+        final String fingerprint;
+        FileEntry(Uri uri, String name, String fingerprint) {
+            this.uri = uri;
+            this.name = name;
+            this.fingerprint = fingerprint;
+        }
     }
+
+    // 指紋に使う先頭バイト数(部分ハッシュ)。全読みを避けつつ実質衝突しない。
+    private static final int HASH_BYTES = 64 * 1024;
 
     private EditText pinField;
     private Button pairBtn;
@@ -440,22 +451,59 @@ public class MainActivity extends Activity
             uris.add(data.getData());
         }
         if (uris.isEmpty()) return;
-        int added = 0;
         for (Uri uri : uris) {
             // 再起動後も同じ音源を再生できるよう読み取り権限を永続化する。
             try {
                 getContentResolver().takePersistableUriPermission(
                         uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             } catch (Throwable ignore) {}
-            if (addOne(uri)) added++;
         }
-        // 追加が発生したときだけ保存・再描画・件数トースト(連発させない)。
-        if (added > 0) {
-            saveFiles();
-            renderFiles();
-            refreshState();
+        // 指紋(サイズ+先頭ハッシュ)計算は I/O なので別スレッドで行い、結果を UI スレッドで反映する。
+        toast("追加中…");
+        new Thread(new AddTask(this, uris), "vc-addfiles").start();
+    }
+
+    // 各 URI の表示名と指紋を(別スレッドで)計算して候補を作り、UI スレッドへ渡す。
+    static final class AddTask implements Runnable {
+        private final MainActivity app;
+        private final List<Uri> uris;
+        AddTask(MainActivity app, List<Uri> uris) { this.app = app; this.uris = uris; }
+        @Override
+        public void run() {
+            List<FileEntry> cands = new ArrayList<>();
+            for (Uri u : uris) {
+                String name = app.queryDisplayName(u);
+                if (name == null || name.isEmpty()) name = u.getLastPathSegment();
+                String fp = app.fileFingerprint(u);  // サイズ+先頭ハッシュ(失敗時 null)
+                cands.add(new FileEntry(u, name, fp));
+            }
+            app.runOnUiThread(new AddApply(app, cands, uris.size()));
         }
-        toast(added + "件追加" + (added < uris.size() ? "（重複はスキップ）" : ""));
+    }
+
+    // 候補を重複除外しながらリストへ反映する(UI スレッド)。
+    static final class AddApply implements Runnable {
+        private final MainActivity app;
+        private final List<FileEntry> cands;
+        private final int requested;
+        AddApply(MainActivity app, List<FileEntry> cands, int requested) {
+            this.app = app; this.cands = cands; this.requested = requested;
+        }
+        @Override
+        public void run() {
+            int added = 0;
+            for (FileEntry c : cands) {
+                if (app.isDuplicate(c)) continue;  // 既存 or 同一バッチ内の重複を除外
+                app.files.add(0, c);
+                added++;
+            }
+            if (added > 0) {
+                app.saveFiles();
+                app.renderFiles();
+                app.refreshState();
+            }
+            app.toast(added + "件追加" + (added < requested ? "（重複はスキップ）" : ""));
+        }
     }
 
     // 音源リストからワンタップ再生: 対象を配信対象にして localhost 経由で再生させる。
@@ -509,12 +557,13 @@ public class MainActivity extends Activity
                 if (o == null) continue;
                 String u = o.optString("uri", null);
                 String n = o.optString("name", null);
+                String fp = o.optString("fp", null);
                 if (u == null) continue;
                 Uri uri = Uri.parse(u);
                 // 永続権限が残っているものだけ有効扱いにする(切れていたら一覧から落とす)。
                 if (!hasPersistedRead(uri)) continue;
                 if (n == null || n.isEmpty()) n = uri.getLastPathSegment();
-                files.add(new FileEntry(uri, n));
+                files.add(new FileEntry(uri, n, fp));
             }
         } catch (Throwable ignore) {}
     }
@@ -526,6 +575,7 @@ public class MainActivity extends Activity
                 JSONObject o = new JSONObject();
                 o.put("uri", e.uri.toString());
                 o.put("name", e.name);
+                if (e.fingerprint != null) o.put("fp", e.fingerprint);
                 arr.put(o);
             } catch (Throwable ignore) {}
         }
@@ -541,18 +591,64 @@ public class MainActivity extends Activity
         return false;
     }
 
-    // 1件をリストへ足すだけ(保存/再描画/トーストは呼び出し側でまとめて行う)。
-    // 重複は除外して false: 同じ URI、または同名(別 URI でも同じファイル扱い。Recent/Downloads 等で
-    // URI が変わっても重複追加させない)。
-    private boolean addOne(Uri uri) {
-        String name = queryDisplayName(uri);
-        if (name == null || name.isEmpty()) name = uri.getLastPathSegment();
+    // 重複判定: 同一 URI、または指紋(サイズ+先頭ハッシュ)一致なら重複。
+    // 指紋が取れなかった(null)候補は内容比較できないため URI 一致のみで判定する。
+    private boolean isDuplicate(FileEntry cand) {
         for (FileEntry e : files) {
-            if (e.uri.equals(uri)) return false;                        // 同一 URI
-            if (name != null && name.equalsIgnoreCase(e.name)) return false;  // 同名は重複扱い
+            if (e.uri.equals(cand.uri)) return true;
+            if (cand.fingerprint != null && cand.fingerprint.equals(e.fingerprint)) return true;
         }
-        files.add(0, new FileEntry(uri, name));
-        return true;
+        return false;
+    }
+
+    // サイズ(OpenableColumns.SIZE)。取得不能は -1。
+    private long querySize(Uri uri) {
+        Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE},
+                    null, null, null);
+            if (c != null && c.moveToFirst()) {
+                int i = c.getColumnIndex(OpenableColumns.SIZE);
+                if (i >= 0 && !c.isNull(i)) return c.getLong(i);
+            }
+        } catch (Throwable ignore) {
+        } finally {
+            if (c != null) try { c.close(); } catch (Throwable ignore) {}
+        }
+        return -1;
+    }
+
+    // 指紋 = "<size>:<先頭 HASH_BYTES の SHA-1(hex)>"。I/O するのでワーカースレッドから呼ぶこと。
+    // 取得失敗時は null(内容比較できない)。
+    private String fileFingerprint(Uri uri) {
+        long size = querySize(uri);
+        InputStream in = null;
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            in = getContentResolver().openInputStream(uri);
+            if (in == null) return null;
+            byte[] buf = new byte[16 * 1024];
+            int total = 0, n;
+            while (total < HASH_BYTES
+                    && (n = in.read(buf, 0, Math.min(buf.length, HASH_BYTES - total))) != -1) {
+                md.update(buf, 0, n);
+                total += n;
+            }
+            return size + ":" + hex(md.digest());
+        } catch (Throwable e) {
+            return null;
+        } finally {
+            if (in != null) try { in.close(); } catch (Throwable ignore) {}
+        }
+    }
+
+    private static String hex(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (byte x : b) {
+            sb.append(Character.forDigit((x >> 4) & 0xF, 16));
+            sb.append(Character.forDigit(x & 0xF, 16));
+        }
+        return sb.toString();
     }
 
     private void removeFile(FileEntry entry) {
