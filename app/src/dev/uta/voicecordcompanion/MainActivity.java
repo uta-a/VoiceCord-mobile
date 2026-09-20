@@ -292,6 +292,10 @@ public class MainActivity extends Activity
         statusLine.setText(paired
                 ? "接続済み（token 保存済み）"
                 : "未接続（まずペアリングしてください）");
+        // 接続後はペアリング操作を無効化(グレーアウト)。未接続なら有効に戻す。
+        setEnabledM3(pairBtn, !paired);
+        setEnabledM3(confirmBtn, !paired);
+        setEnabledM3(pinField, !paired);
         setEnabledM3(soundIdField, paired);
         setEnabledM3(gainField, paired);
         setEnabledM3(playBtn, paired);
@@ -392,7 +396,7 @@ public class MainActivity extends Activity
         sendBroadcast(i);
         soundIdField.setText(soundId);
         addHistory(soundId);
-        toast("再生: " + soundId);
+        // 再生時のトーストは出さない(邪魔なので抑制)。
     }
 
     private void sendStop() {
@@ -410,6 +414,7 @@ public class MainActivity extends Activity
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         i.setType("audio/*");
+        i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);  // 長押し→複数選択でまとめて追加
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
                 | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try {
@@ -423,14 +428,34 @@ public class MainActivity extends Activity
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != REQ_PICK || resultCode != RESULT_OK || data == null) return;
-        Uri uri = data.getData();
-        if (uri == null) return;
-        // 再起動後も同じ音源を再生できるよう読み取り権限を永続化する。
-        try {
-            getContentResolver().takePersistableUriPermission(
-                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        } catch (Throwable ignore) {}
-        addFile(uri);
+        // 複数選択(ClipData)と単一選択(getData)の両対応。
+        List<Uri> uris = new ArrayList<>();
+        if (data.getClipData() != null) {
+            android.content.ClipData cd = data.getClipData();
+            for (int i = 0; i < cd.getItemCount(); i++) {
+                Uri u = cd.getItemAt(i).getUri();
+                if (u != null) uris.add(u);
+            }
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+        if (uris.isEmpty()) return;
+        int added = 0;
+        for (Uri uri : uris) {
+            // 再起動後も同じ音源を再生できるよう読み取り権限を永続化する。
+            try {
+                getContentResolver().takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } catch (Throwable ignore) {}
+            if (addOne(uri)) added++;
+        }
+        // 追加が発生したときだけ保存・再描画・件数トースト(連発させない)。
+        if (added > 0) {
+            saveFiles();
+            renderFiles();
+            refreshState();
+        }
+        toast(added + "件追加" + (added < uris.size() ? "（重複はスキップ）" : ""));
     }
 
     // 音源リストからワンタップ再生: 対象を配信対象にして localhost 経由で再生させる。
@@ -448,7 +473,7 @@ public class MainActivity extends Activity
         i.putExtra("token", token);
         i.putExtra("gain", parseGain());
         sendBroadcast(i);
-        toast("再生: " + entry.name);
+        // 再生時のトーストは出さない(邪魔なので抑制)。
     }
 
     // localhost 待受(LocalFileServer)が配信時に参照する(別スレッドから読まれる)。
@@ -516,18 +541,16 @@ public class MainActivity extends Activity
         return false;
     }
 
-    private void addFile(Uri uri) {
-        // 既に同じ URI があれば重複追加しない。
+    // 1件をリストへ足すだけ(保存/再描画/トーストは呼び出し側でまとめて行う)。
+    // 既に同じ URI があれば false(重複スキップ)。
+    private boolean addOne(Uri uri) {
         for (FileEntry e : files) {
-            if (e.uri.equals(uri)) { toast("追加済みです"); return; }
+            if (e.uri.equals(uri)) return false;
         }
         String name = queryDisplayName(uri);
         if (name == null || name.isEmpty()) name = uri.getLastPathSegment();
         files.add(0, new FileEntry(uri, name));
-        saveFiles();
-        renderFiles();
-        refreshState();
-        toast("追加: " + name);
+        return true;
     }
 
     private void removeFile(FileEntry entry) {
