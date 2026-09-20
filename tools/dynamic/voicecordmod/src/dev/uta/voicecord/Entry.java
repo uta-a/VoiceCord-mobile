@@ -10,8 +10,6 @@ import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
-import java.io.File;
-import java.io.FileOutputStream;
 import java.lang.reflect.Method;
 import java.security.SecureRandom;
 
@@ -87,6 +85,7 @@ public class Entry implements IXposedHookLoadPackage {
                 f.addAction(CommandReceiver.ACTION_STOP);
                 f.addAction(CommandReceiver.ACTION_SET);
                 f.addAction(CommandReceiver.ACTION_PING);
+                f.addAction(CommandReceiver.ACTION_PAIR);  // フェーズ3: コンパニオンとの PIN ペアリング
                 CommandReceiver rx = new CommandReceiver();
                 if (Build.VERSION.SDK_INT >= 33) {
                     ctx.registerReceiver(rx, f, Context.RECEIVER_EXPORTED);
@@ -94,15 +93,9 @@ public class Entry implements IXposedHookLoadPackage {
                     ctx.registerReceiver(rx, f);
                 }
                 XposedBridge.log("[voicecord] CommandReceiver 登録完了");
-                // token をファイルにも出力(テスト時の取得用)。
-                // TODO(フェーズ3): これはテスト専用。コンパニオンとのペアリング(content:// call)に
-                //   置き換え、この平文ファイル出力は削除する(唯一のアクセス制御の漏洩経路のため)。
-                try {
-                    File out = new File(ctx.getCacheDir(), "vc_token");
-                    FileOutputStream fos = new FileOutputStream(out);
-                    fos.write(TOKEN.getBytes());
-                    fos.close();
-                } catch (Throwable ignore) {}
+                // フェーズ3: 平文 vc_token ファイル出力は廃止した。token はコンパニオンとの
+                //   PIN ペアリング(PAIR request→通知 PIN→confirm→PAIRED で reply_pkg 宛にのみ返す)
+                //   でのみ渡す。cache に平文で置く経路(唯一のアクセス制御の漏洩点)を無くす。
             } catch (Throwable e) {
                 XposedBridge.log("[voicecord] レシーバ登録失敗:");
                 XposedBridge.log(e);

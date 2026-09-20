@@ -31,6 +31,13 @@ public class CommandReceiver extends BroadcastReceiver {
     public static final String ACTION_STOP = "dev.uta.voicecord.STOP";
     public static final String ACTION_SET = "dev.uta.voicecord.SET";
     public static final String ACTION_PING = "dev.uta.voicecord.PING";
+    // フェーズ3: コンパニオンへ token を渡す PIN ペアリング。PAIR は token 不要のブートストラップ。
+    // confirm は「順序付きブロードキャスト」で送られ、成功時に token を結果データで返す
+    // (= 送信元コンパニオンにしか戻らない。exported レシーバ不要で token を世に出さない)。
+    public static final String ACTION_PAIR = "dev.uta.voicecord.PAIR";
+
+    // PIN ペアリングの状態管理(pending PIN の生成・検証・失効)。同一 classloader で 1 個。
+    static final PairingManager PAIRING = new PairingManager();
 
     // 再生世代。PLAY/STOP のたびに +1 し、旧デコードスレッドは自分の世代と不一致になったら
     // 自発終了する。これで PLAY 連打/STOP 時の複数 producer 同時書き込み(SPSC 破綻)と
@@ -42,7 +49,14 @@ public class CommandReceiver extends BroadcastReceiver {
         String action = intent == null ? null : intent.getAction();
         if (action == null) return;
 
-        // token 検証(全アクション必須)。
+        // PAIR は token を渡すためのブートストラップなので token 検証の前に処理する
+        // (PIN が実質の認証。PairingManager が生成・検証・失効を管理する)。
+        if (ACTION_PAIR.equals(action)) {
+            handlePair(context, intent);
+            return;
+        }
+
+        // token 検証(PAIR 以外の全アクション必須)。
         String token = intent.getStringExtra("token");
         if (Entry.TOKEN == null || !Entry.TOKEN.equals(token)) {
             XposedBridge.log("[voicecord] token 不一致で拒否: action=" + action);
@@ -87,6 +101,36 @@ public class CommandReceiver extends BroadcastReceiver {
             Thread t = new Thread(new FetchTask(context.getApplicationContext().getCacheDir(), soundId, myGen),
                     "voicecord-sb-fetch");
             t.start();
+        }
+    }
+
+    // PAIR(request/confirm) を処理する。token 不要のブートストラップ。
+    //   request: reply_pkg 宛に PIN を発行し通知表示(PairingManager)。
+    //   confirm: 順序付きブロードキャストで送られる。PIN 検証に成功したら結果データに token を
+    //            セットして返す。結果は送信元コンパニオンにしか戻らないので、token を
+    //            ワイルドカードなブロードキャストや exported レシーバに晒さずに渡せる。
+    private void handlePair(Context context, Intent intent) {
+        String step = intent.getStringExtra("step");
+        String replyPkg = intent.getStringExtra("reply_pkg");
+        if ("request".equals(step)) {
+            PAIRING.onRequest(context.getApplicationContext(), replyPkg);
+        } else if ("confirm".equals(step)) {
+            String pin = intent.getStringExtra("pin");
+            if (Entry.TOKEN == null) {
+                XposedBridge.log("[voicecord] PAIR: token 未生成のため confirm 不可");
+                return;
+            }
+            boolean ok = PAIRING.onConfirm(pin, replyPkg);
+            // token は「順序付きブロードキャストの結果」でのみ返す(送信元にしか戻らない)。
+            // 非順序で来た confirm は結果を返せないため成立させない(コンパニオンは必ず順序付きで送る)。
+            if (ok && isOrderedBroadcast()) {
+                setResultData(Entry.TOKEN);
+                XposedBridge.log("[voicecord] PAIR: 結果データで token を返却");
+            } else if (ok) {
+                XposedBridge.log("[voicecord] PAIR: 非順序 confirm のため token を返せない(順序付きで送ること)");
+            }
+        } else {
+            XposedBridge.log("[voicecord] PAIR: 不明な step=" + step);
         }
     }
 

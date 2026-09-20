@@ -173,3 +173,32 @@ native SPSCリングバッファ→intercept pre で送信PCMに合成、を実�
   `canUseSoundboardEverywhere` の直接改変。いずれも不確実 / 高難度(**未検証**)。
 - 方針: **Nitro ロック除去は断念**。サウンドボード再生目的は案B(CDN 取得→注入)で
   達成済みのため、UI アンロックは不要と判断。
+
+## 5. フェーズ3: コンパニオン(別APK)への token 受け渡し設計と認可モデル
+
+- 目的: フェーズ2の平文 token(`cache/vc_token` 直書き)を廃止し、別APKコンパニオンへ
+  操作 token を安全に渡す。`vc_token` ファイル出力は削除済み(唯一の漏洩点を除去)。
+- 方式: **PIN ペアリング**。
+  1. コンパニオン → `PAIR{step=request, reply_pkg=自身}` を `setPackage("com.discord")` で送信。
+  2. モジュール(Discord プロセス)が 6 桁 PIN を生成し**通知**で表示(端末画面を見ている本人だけが
+     読める=物理所持が人間側の認証点)。通知は channel `voicecord_pairing`・VISIBILITY_SECRET。
+  3. 本人がコンパニオンへ PIN 入力 → `PAIR{step=confirm, pin, reply_pkg}` を **順序付き**
+     ブロードキャストで送信。
+  4. モジュールが PIN 検証(一致・未失効・reply_pkg 一致)に成功したら **順序付きの結果データ**で
+     token を返す。→ token は送信元コンパニオンにしか戻らず、exported レシーバ不要で世に出ない。
+  5. コンパニオンは token を自身の private `SharedPreferences` に保存。以降のコマンドに付与。
+- 実機検証(pipa, 345.9): request→PIN 通知(例 791543)→誤 PIN は結果 data 無し(拒否)→
+  正 PIN で `Broadcast completed: result=0, data="<token>"`。誤 token の PLAY_SB は
+  「token 不一致で拒否」、ペアリング取得 token では PLAY_SB 受理→decode 完了。UI 経由でも
+  起動→ペアリング→token 永続化→再生まで一連成立。
+- ホストテスト(`PairingManagerTest`, 実機不要, 13 ケース ALL PASS): PIN 一致 / reply_pkg 束縛
+  (別 pkg は拒否かつ pending 非消費) / 試行回数 `MAX_ATTEMPTS`(=5) 失効 / 成功後の使い切り /
+  request スロットル。60 秒失効は時刻依存のため host では非対象(実機/設計で担保)。
+- 残存リスク(MVP として受容):
+  - `PAIR` は token 不要のブートストラップ。悪意アプリが request を連投して通知を出させる DoS →
+    `REQUEST_THROTTLE_MS`(2s)で緩和。
+  - PIN ブルートフォース → 6 桁 + 60 秒有効 + 5 回失敗で失効 + 同時 1 pending で緩和。
+  - 攻撃者が reply_pkg に自分を指定し順序付き confirm で token を奪う経路 → PIN は画面通知に
+    しか出ないため PIN 非知で不成立。加えて「身に覚えのないペアリング通知」が人間側の検知点。
+  - コンパニオンの PLAY は端末内任意パス(`ACTION_PLAY`)も送れる(モジュール側の既存ギャップは
+    不変)。sound_id 経路は数字 ID 限定で従来どおり。
