@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- フェーズ3: VoiceCord コンパニオン(別APK)。Discord プロセス内の voicecordmod へ
+     ブロードキャストで PLAY_SB/STOP/SET を送り、PIN ペアリングで操作 token を受け取る。
+     res は持たず UI はコード生成。アイコン/ラベルは framework リソースと文字列で済ませる。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.uta.voicecordcompanion">
+
+    <!-- インターネット等の危険権限は不要。すべて同一端末内のブロードキャストのみ。 -->
+
+    <application
+        android:label="VoiceCord Companion"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="false">
+        <activity
+            android:name="dev.uta.voicecordcompanion.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

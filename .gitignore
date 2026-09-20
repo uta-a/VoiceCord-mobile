@@ -25,3 +25,7 @@ tools/dynamic/out_vc/
 tools/dynamic/shadowhook/extracted/
 tools/dynamic/shadowhook/*.aar
 tools/dynamic/*.idsig
+
+# フェーズ3 コンパニオン(app/)ビルド生成物
+app/build/
+app/*.idsig
