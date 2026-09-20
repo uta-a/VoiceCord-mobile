@@ -26,6 +26,9 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -44,7 +47,8 @@ import java.util.List;
 // 実装上の約束(従来どおり):
 //   - ブロードキャストは setPackage("com.discord")。PIN confirm / PING は順序付きで結果受領。
 //   - d8 8.2.2 対策で匿名クラス/ラムダを使わず、リスナは implements、結果レシーバは名前付き static。
-public class MainActivity extends Activity implements View.OnClickListener {
+public class MainActivity extends Activity
+        implements View.OnClickListener, View.OnLongClickListener {
 
     // voicecordmod と一致させる定数。
     static final String TARGET_PKG = "com.discord";
@@ -56,17 +60,24 @@ public class MainActivity extends Activity implements View.OnClickListener {
 
     private static final String PREFS = "vc_companion";
     private static final String KEY_TOKEN = "token";
-    private static final String KEY_FILE_URI = "file_uri";
+    private static final String KEY_FILES = "files";       // 音源リスト(SAF で追加したファイル群)
     private static final String KEY_HISTORY = "history";
     private static final int MAX_HISTORY = 8;
     private static final int REQ_PICK = 1001;
 
     private SharedPreferences prefs;
     private String token;        // ペアリング済みなら非 null。
-    private Uri pickedUri;       // SAF で選んだファイル(永続化された読み取り権限を持つ)。
-    private String pickedName;
+    private Uri pickedUri;       // 直近タップした音源(localhost 配信対象)。再生時にセット。
     private final List<String> history = new ArrayList<>();
+    private final List<FileEntry> files = new ArrayList<>();  // 音源リスト(ワンタップ再生)
     private LocalFileServer server;  // ファイル再生用の 127.0.0.1 待受(遅延起動)。
+
+    // 音源リストの1件(SAF の URI と表示名)。永続 URI 権限を持つ前提。
+    static final class FileEntry {
+        final Uri uri;
+        final String name;
+        FileEntry(Uri uri, String name) { this.uri = uri; this.name = name; }
+    }
 
     private EditText pinField;
     private Button pairBtn;
@@ -78,9 +89,8 @@ public class MainActivity extends Activity implements View.OnClickListener {
     private Button playBtn;
     private Button stopBtn;
     private Button pingBtn;
-    private TextView fileLabel;
-    private Button pickBtn;
-    private Button playFileBtn;
+    private LinearLayout filesContainer;
+    private Button addFileBtn;
     private LinearLayout historyContainer;
     private Button forgetBtn;
 
@@ -98,9 +108,10 @@ public class MainActivity extends Activity implements View.OnClickListener {
         server = new LocalFileServer(this);
         resolvePalette();
         applySystemBars();
-        loadPickedUri();
+        loadFiles();
         loadHistory();
         setContentView(buildUi());
+        renderFiles();
         renderHistory();
         refreshState();
     }
@@ -248,16 +259,13 @@ public class MainActivity extends Activity implements View.OnClickListener {
         stopBtn = tonalButton("停止", cSecondaryContainer, cOnSecondaryContainer);
         addGap(sbCard, stopBtn, 8);
 
-        // ファイル再生。
-        LinearLayout fileCard = card(root, "ファイル再生(端末内音源)");
-        fileLabel = new TextView(this);
-        fileLabel.setTextColor(cOnSurfaceVariant);
-        fileLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        fileCard.addView(fileLabel, mw());
-        pickBtn = tonalButton("ファイルを選択", cSecondaryContainer, cOnSecondaryContainer);
-        addGap(fileCard, pickBtn, 10);
-        playFileBtn = filledButton("選択ファイルを再生");
-        addGap(fileCard, playFileBtn, 8);
+        // 音源リスト(端末内ファイル)。一覧からワンタップ再生、長押しで削除。
+        LinearLayout fileCard = card(root, "音源リスト(タップで再生・長押しで削除)");
+        filesContainer = new LinearLayout(this);
+        filesContainer.setOrientation(LinearLayout.VERTICAL);
+        fileCard.addView(filesContainer, mw());
+        addFileBtn = tonalButton("＋ 音源を追加", cSecondaryContainer, cOnSecondaryContainer);
+        addGap(fileCard, addFileBtn, 8);
 
         // 状態。
         LinearLayout stateCard = card(root, "状態");
@@ -289,19 +297,20 @@ public class MainActivity extends Activity implements View.OnClickListener {
         setEnabledM3(playBtn, paired);
         setEnabledM3(stopBtn, paired);
         setEnabledM3(pingBtn, paired);
-        // ファイル選択自体は未接続でも可。再生は token 必須。
-        setEnabledM3(playFileBtn, paired && pickedUri != null);
         setEnabledM3(forgetBtn, paired);
-        fileLabel.setText(pickedUri == null
-                ? "選択ファイル: なし"
-                : "選択ファイル: " + (pickedName != null ? pickedName : pickedUri.getLastPathSegment()));
+        // 音源の追加は未接続でも可。再生(リストのボタン)は token 必須。
+        setFilesEnabled(paired);
         setHistoryEnabled(paired);
     }
 
     @Override
     public void onClick(View v) {
-        // 履歴ボタンは tag に sound_id を持たせて識別する(匿名クラス回避)。
+        // 音源リストのボタンは tag に FileEntry、履歴ボタンは tag に String(sound_id)を持たせて識別。
         Object tag = v.getTag();
+        if (tag instanceof FileEntry) {
+            playFile((FileEntry) tag);
+            return;
+        }
         if (tag instanceof String) {
             playSoundId((String) tag);
             return;
@@ -316,15 +325,24 @@ public class MainActivity extends Activity implements View.OnClickListener {
             playSoundId(id);
         } else if (v == stopBtn) {
             sendStop();
-        } else if (v == pickBtn) {
+        } else if (v == addFileBtn) {
             startFilePicker();
-        } else if (v == playFileBtn) {
-            sendPlayUri();
         } else if (v == pingBtn) {
             sendPing();
         } else if (v == forgetBtn) {
             forgetToken();
         }
+    }
+
+    // 音源リストのボタンを長押しで削除する。
+    @Override
+    public boolean onLongClick(View v) {
+        Object tag = v.getTag();
+        if (tag instanceof FileEntry) {
+            removeFile((FileEntry) tag);
+            return true;
+        }
+        return false;
     }
 
     // --- ペアリング ---
@@ -407,25 +425,22 @@ public class MainActivity extends Activity implements View.OnClickListener {
         if (requestCode != REQ_PICK || resultCode != RESULT_OK || data == null) return;
         Uri uri = data.getData();
         if (uri == null) return;
-        // 再起動後も同じファイルを再生できるよう読み取り権限を永続化する。
+        // 再起動後も同じ音源を再生できるよう読み取り権限を永続化する。
         try {
             getContentResolver().takePersistableUriPermission(
                     uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
         } catch (Throwable ignore) {}
-        pickedUri = uri;
-        pickedName = queryDisplayName(uri);
-        prefs.edit().putString(KEY_FILE_URI, uri.toString()).apply();
-        refreshState();
-        toast("選択: " + (pickedName != null ? pickedName : uri.getLastPathSegment()));
+        addFile(uri);
     }
 
-    private void sendPlayUri() {
+    // 音源リストからワンタップ再生: 対象を配信対象にして localhost 経由で再生させる。
+    private void playFile(FileEntry entry) {
         if (token == null) { toast("未接続です"); return; }
-        if (pickedUri == null) { toast("ファイルを選択してください"); return; }
-        // SAF/ContentProvider は package visibility で Discord から読めないため、127.0.0.1 の
-        // 待受を立て、Discord に http://127.0.0.1:PORT/<token> を取得させる(token 一致時のみ配信)。
+        pickedUri = entry.uri;   // LocalFileServer.currentUri() が配信に使う
         int port = server.ensureStarted();
         if (port <= 0) { toast("ローカル待受の起動に失敗しました"); return; }
+        // SAF/ContentProvider は package visibility で Discord から読めないため、127.0.0.1 の
+        // 待受を立て、Discord に http://127.0.0.1:PORT/<token> を取得させる(token 一致時のみ配信)。
         String url = "http://127.0.0.1:" + port + "/" + token;
         Intent i = new Intent(ACTION_PLAY_URI);
         i.setPackage(TARGET_PKG);
@@ -433,7 +448,7 @@ public class MainActivity extends Activity implements View.OnClickListener {
         i.putExtra("token", token);
         i.putExtra("gain", parseGain());
         sendBroadcast(i);
-        toast("ファイル再生");
+        toast("再生: " + entry.name);
     }
 
     // localhost 待受(LocalFileServer)が配信時に参照する(別スレッドから読まれる)。
@@ -456,23 +471,109 @@ public class MainActivity extends Activity implements View.OnClickListener {
         return null;
     }
 
-    private void loadPickedUri() {
-        String s = prefs.getString(KEY_FILE_URI, null);
-        if (s == null) return;
+    // --- 音源リスト ---
+
+    private void loadFiles() {
+        files.clear();
+        String s = prefs.getString(KEY_FILES, null);
+        if (s == null || s.isEmpty()) return;
         try {
-            Uri uri = Uri.parse(s);
-            // 永続権限が残っているものだけ有効扱いにする。
-            boolean held = false;
-            for (android.content.UriPermission p : getContentResolver().getPersistedUriPermissions()) {
-                if (p.getUri().equals(uri) && p.isReadPermission()) { held = true; break; }
-            }
-            if (held) {
-                pickedUri = uri;
-                pickedName = queryDisplayName(uri);
-            } else {
-                prefs.edit().remove(KEY_FILE_URI).apply();
+            JSONArray arr = new JSONArray(s);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                String u = o.optString("uri", null);
+                String n = o.optString("name", null);
+                if (u == null) continue;
+                Uri uri = Uri.parse(u);
+                // 永続権限が残っているものだけ有効扱いにする(切れていたら一覧から落とす)。
+                if (!hasPersistedRead(uri)) continue;
+                if (n == null || n.isEmpty()) n = uri.getLastPathSegment();
+                files.add(new FileEntry(uri, n));
             }
         } catch (Throwable ignore) {}
+    }
+
+    private void saveFiles() {
+        JSONArray arr = new JSONArray();
+        for (FileEntry e : files) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("uri", e.uri.toString());
+                o.put("name", e.name);
+                arr.put(o);
+            } catch (Throwable ignore) {}
+        }
+        prefs.edit().putString(KEY_FILES, arr.toString()).apply();
+    }
+
+    private boolean hasPersistedRead(Uri uri) {
+        try {
+            for (android.content.UriPermission p : getContentResolver().getPersistedUriPermissions()) {
+                if (p.getUri().equals(uri) && p.isReadPermission()) return true;
+            }
+        } catch (Throwable ignore) {}
+        return false;
+    }
+
+    private void addFile(Uri uri) {
+        // 既に同じ URI があれば重複追加しない。
+        for (FileEntry e : files) {
+            if (e.uri.equals(uri)) { toast("追加済みです"); return; }
+        }
+        String name = queryDisplayName(uri);
+        if (name == null || name.isEmpty()) name = uri.getLastPathSegment();
+        files.add(0, new FileEntry(uri, name));
+        saveFiles();
+        renderFiles();
+        refreshState();
+        toast("追加: " + name);
+    }
+
+    private void removeFile(FileEntry entry) {
+        files.remove(entry);
+        // 永続権限も解放しておく(端末側の付与残りを溜めない)。
+        try {
+            getContentResolver().releasePersistableUriPermission(
+                    entry.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (Throwable ignore) {}
+        saveFiles();
+        renderFiles();
+        refreshState();
+        toast("削除: " + entry.name);
+    }
+
+    // 音源リストを作り直す(件数が少ないので removeAllViews→再生成)。
+    private void renderFiles() {
+        if (filesContainer == null) return;
+        filesContainer.removeAllViews();
+        if (files.isEmpty()) {
+            TextView t = new TextView(this);
+            t.setText("音源なし（＋で追加）");
+            t.setTextColor(cOnSurfaceVariant);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+            filesContainer.addView(t, mw());
+            return;
+        }
+        boolean paired = token != null;
+        boolean first = true;
+        for (FileEntry e : files) {
+            Button b = tonalButton("▶ " + e.name, cSecondaryContainer, cOnSecondaryContainer);
+            b.setTag(e);                 // onClick/onLongClick で識別
+            b.setOnLongClickListener(this);
+            addGap(filesContainer, b, first ? 0 : 8);
+            setEnabledM3(b, paired);
+            first = false;
+        }
+    }
+
+    private void setFilesEnabled(boolean paired) {
+        setEnabledM3(addFileBtn, true);  // 追加は常時可
+        if (filesContainer == null) return;
+        for (int i = 0; i < filesContainer.getChildCount(); i++) {
+            View c = filesContainer.getChildAt(i);
+            if (c instanceof Button) setEnabledM3(c, paired);
+        }
     }
 
     // --- 状態(PING) ---
