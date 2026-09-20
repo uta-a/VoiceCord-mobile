@@ -175,6 +175,10 @@ public class CommandReceiver extends BroadcastReceiver {
                 return;
             }
             boolean ok = PAIRING.onConfirm(pin, replyPkg);
+            if (ok) {
+                // 接続確定で PIN 通知を消す(残って再生時に見えるのを防ぐ)。
+                PAIRING.dismissNotification(context.getApplicationContext());
+            }
             // token は「順序付きブロードキャストの結果」でのみ返す(送信元にしか戻らない)。
             // 非順序で来た confirm は結果を返せないため成立させない(コンパニオンは必ず順序付きで送る)。
             if (ok && isOrderedBroadcast()) {

@@ -142,6 +142,15 @@ public final class PairingManager {
         return diff == 0;
     }
 
+    // 接続成功時などに PIN 通知を消す。CommandReceiver の confirm 成功で呼ぶ。
+    void dismissNotification(Context context) {
+        try {
+            NotificationManager nm =
+                    (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(NOTIF_ID);
+        } catch (Throwable ignore) {}
+    }
+
     // PIN を通知で表示する。Discord プロセス側の通知権限で出る(API33+ の POST_NOTIFICATIONS は
     // ホスト Discord に付与済みの想定)。チャンネルは API26+ で必要。
     private void showPinNotification(Context context, String pin, String replyPkg) {
@@ -162,14 +171,16 @@ public final class PairingManager {
                     ? new Notification.Builder(context, CHANNEL_ID)
                     : new Notification.Builder(context);
             // アイコンは host にある汎用 android アイコンを流用(モジュールに drawable を持たないため)。
+            // 長い BigTextStyle は接続後も残ると邪魔なので廃し、1 行の短い表示にする。
             b.setSmallIcon(android.R.drawable.ic_lock_idle_lock)
-                    .setContentTitle("VoiceCord ペアリング PIN")
-                    .setContentText(pin + "  （" + replyPkg + "）")
-                    .setStyle(new Notification.BigTextStyle().bigText(
-                            "PIN: " + pin + "\n要求元: " + replyPkg
-                                    + "\n身に覚えがなければ無視してください（60秒で失効）"))
+                    .setContentTitle("VoiceCord PIN: " + pin)
+                    .setContentText("コンパニオンに入力（60秒で失効）")
                     .setAutoCancel(true)
-                    .setOnlyAlertOnce(false);
+                    .setOnlyAlertOnce(true);
+            if (Build.VERSION.SDK_INT >= 26) {
+                // 60 秒(PIN_TTL_MS)で自動消滅。接続しなくても残さない。
+                b.setTimeoutAfter(PIN_TTL_MS);
+            }
             if (Build.VERSION.SDK_INT >= 21) {
                 b.setVisibility(Notification.VISIBILITY_SECRET);  // ロック画面には出さない
             }
