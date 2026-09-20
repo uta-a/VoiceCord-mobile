@@ -25,8 +25,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 //   本番ではトークンだけでは不十分(docs/FINDINGS.md にギャップとして記載)。
 public class CommandReceiver extends BroadcastReceiver {
 
-    public static final String ACTION_PLAY = "dev.uta.voicecord.PLAY";
-    // 案B: sound_id から CDN 取得→キャッシュ→既存デコード経路で再生。任意パスではなく数字 ID のみ。
+    // sound_id から CDN 取得→キャッシュ→既存デコード経路で再生。任意パスではなく数字 ID のみ。
+    // (任意ローカルパスを読む旧 ACTION_PLAY は配布に伴い撤去。攻撃面を残さない。)
     public static final String ACTION_PLAY_SB = "dev.uta.voicecord.PLAY_SB";
     // フェーズ3拡張: コンパニオンが SAF で選んだ content:// を一時読み取り権限付きで受け再生。
     // Intent.getData() の URI を FLAG_GRANT_READ_URI_PERMISSION 付きで受け取り、権限が有効な
@@ -79,19 +79,6 @@ public class CommandReceiver extends BroadcastReceiver {
             XposedBridge.log("[voicecord] state=" + state);
             // コンパニオンが順序付きで PING したら state を結果データで返す(UI 表示用)。
             if (isOrderedBroadcast()) setResultData(String.valueOf(state));
-        } else if (ACTION_PLAY.equals(action)) {
-            String path = intent.getStringExtra("path");
-            float gain = intent.getFloatExtra("gain", 1.0f);
-            float duck = intent.getFloatExtra("duck", 1.0f);
-            if (path == null) {
-                XposedBridge.log("[voicecord] PLAY: path 無し");
-                return;
-            }
-            NativeBridge.nativeSetParams(gain, duck);
-            int myGen = GEN.incrementAndGet();  // 旧デコードスレッドを終了させる
-            NativeBridge.nativeStop();          // 前の再生分をリングから捨てる
-            Thread t = new Thread(new DecodeTask(path, myGen), "voicecord-decode");
-            t.start();
         } else if (ACTION_PLAY_SB.equals(action)) {
             String soundId = intent.getStringExtra("sound_id");
             float gain = intent.getFloatExtra("gain", 1.0f);
