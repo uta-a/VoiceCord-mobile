@@ -202,3 +202,29 @@ native SPSCリングバッファ→intercept pre で送信PCMに合成、を実�
     しか出ないため PIN 非知で不成立。加えて「身に覚えのないペアリング通知」が人間側の検知点。
   - コンパニオンの PLAY は端末内任意パス(`ACTION_PLAY`)も送れる(モジュール側の既存ギャップは
     不変)。sound_id 経路は数字 ID 限定で従来どおり。
+
+## 6. フェーズ3拡張: 端末内ファイル再生は localhost ブリッジで実現(SAF/Provider は不可)
+
+- コンパニオンから端末内音源を再生する経路として SAF(ACTION_OPEN_DOCUMENT)→ 何らかの方法で
+  com.discord に読ませる、を検討したが、以下がすべて実機(pipa/MIUI)で不成立:
+  - SAF の DocumentsProvider URI を `grantUriPermission` で com.discord へ再共有 →
+    `Permission Denial: opening provider ...DownloadStorageProvider ... requires ACTION_OPEN_DOCUMENT`。
+    DocumentsProvider は「自分で開いたアプリ」しか読めず、第三者付与を受け付けない。
+  - コンパニオン自作 ContentProvider(exported=true/grant 付き)を立てても com.discord から
+    `Failed to find provider info`。**Android 11+ の package visibility** で、com.discord は別アプリの
+    Provider authority を解決できない(URI grant でも可視化されない)。Discord の manifest に
+    `<queries>`/`QUERY_ALL_PACKAGES` が要るがこちらから改変不可。
+  - `/sdcard` 直パスを `ACTION_PLAY` に渡しても scoped storage で Discord が読めず decode 失敗。
+- 成立した方式: **localhost ブリッジ**。サウンドボードと同じ「Discord が INTERNET 権限で
+  ネットワーク取得する」形に寄せる。
+  - コンパニオン(`LocalFileServer`)が **127.0.0.1(IPv4 明示 bind)** の空きポートで極小 HTTP/1.0 を待受。
+    `GET /<token>` の token がペアリング済み token と一致した時だけ、選択中の 1 ファイルを配信。
+    bind はループバックのみ(端末外から到達不可)、配信対象は現在選択中ファイルに限定。
+  - モジュール(`LocalFetcher`)が **生ソケット** で GET し cache に保存してから既存デコード経路へ。
+    生ソケットにするのは HttpURLConnection/MediaExtractor 経由の http がホストの cleartext ポリシーで
+    弾かれうるため(生ソケットは対象外)。取得先は `http://(127.0.0.1|localhost):PORT/...` に正規表現で固定。
+  - ハマり所: (1) `InetAddress.getLoopbackAddress()` が `::1`(IPv6)を返し IPv4 接続が ECONNREFUSED →
+    IPv4 127.0.0.1 に明示 bind。(2) サーバがリクエスト行しか読まず受信バッファを残して close すると
+    カーネルが RST を返し client 側 "Connection reset" → 応答前に残りのヘッダを空行まで読み捨てる。
+  - 実機検証: `LOCAL: 取得完了 bytes=17554` → decode 完了。UI(SAF 選択→選択ファイルを再生)で成立。
+- ホストテスト: `LocalFetcherTest`(14 ケース ALL PASS)で loopback+http+ポート必須のガードを検証。
