@@ -12,7 +12,8 @@
     <application
         android:label="VoiceCord Companion"
         android:icon="@android:drawable/sym_def_app_icon"
-        android:allowBackup="false">
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight"><!-- M3: ライト/ダーク追従。ActionBar はコードで非表示にし自作トップバーを使う -->
         <activity
             android:name="dev.uta.voicecordcompanion.MainActivity"
             android:exported="true">

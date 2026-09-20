@@ -5,8 +5,14 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.database.Cursor;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.text.InputType;
@@ -23,17 +29,21 @@ import android.widget.Toast;
 import java.util.ArrayList;
 import java.util.List;
 
-// フェーズ3 コンパニオン。
+// フェーズ3 コンパニオン(Material You / Material 3 デザイン)。
 //   基本: PIN ペアリングで token を受け取り、sound_id 再生 / 停止 / 音量。
-//   拡張: (1) SAF で端末内ファイルを選び一時読み取り権限付きで再生 (2) 状態確認(PING) (3) 履歴。
+//   拡張: (1) SAF で端末内ファイルを選び localhost 経由で再生 (2) 状態確認(PING) (3) 履歴。
 //
-// 設計上の約束:
-//   - すべてのブロードキャストは setPackage("com.discord") で voicecordmod にだけ届ける。
-//   - PIN confirm / PING は sendOrderedBroadcast で送り、結果データで受け取る(送信元にのみ戻る)。
-//   - ファイル再生は content:// を FLAG_GRANT_READ_URI_PERMISSION 付きで渡す(選んだ1ファイルの
-//     一時読み取りのみ。常時権限や /sdcard 直パスは使わない)。
-//   - d8 8.2.2 対策で匿名クラス/ラムダは使わず、リスナは implements、結果レシーバは名前付き
-//     static クラス。履歴ボタンは setTag(sound_id) で識別する。
+// デザイン方針:
+//   - res を持たずコードで UI 生成する制約のまま Material 3 を実装する。
+//   - 色は Android 12+ の「Material You ダイナミックカラー」(android.R.color.system_* トーナル
+//     パレット=壁紙連動)を採用。API<31 と取得失敗時は M3 ベースライン(紫)にフォールバック。
+//   - ライト/ダークは端末設定に追従(Theme.DeviceDefault.DayNight.NoActionBar + 夜間判定で配色切替)。
+//   - 構成要素: トップアプリバー / 角丸カード(surfaceContainer) / Filled ボタン(primary) /
+//     Tonal ボタン(secondaryContainer) / アウトライン入力欄 / Ripple。
+//
+// 実装上の約束(従来どおり):
+//   - ブロードキャストは setPackage("com.discord")。PIN confirm / PING は順序付きで結果受領。
+//   - d8 8.2.2 対策で匿名クラス/ラムダを使わず、リスナは implements、結果レシーバは名前付き static。
 public class MainActivity extends Activity implements View.OnClickListener {
 
     // voicecordmod と一致させる定数。
@@ -74,12 +84,20 @@ public class MainActivity extends Activity implements View.OnClickListener {
     private LinearLayout historyContainer;
     private Button forgetBtn;
 
+    // --- Material 3 パレット(onCreate で解決) ---
+    private int cPrimary, cOnPrimary, cSecondaryContainer, cOnSecondaryContainer;
+    private int cSurface, cOnSurface, cOnSurfaceVariant, cSurfaceContainer, cOutline;
+    private int cErrorContainer, cOnErrorContainer;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (getActionBar() != null) getActionBar().hide();  // M3 自作トップバーを使うため既定を隠す
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         token = prefs.getString(KEY_TOKEN, null);
         server = new LocalFileServer(this);
+        resolvePalette();
+        applySystemBars();
         loadPickedUri();
         loadHistory();
         setContentView(buildUi());
@@ -87,81 +105,193 @@ public class MainActivity extends Activity implements View.OnClickListener {
         refreshState();
     }
 
+    // ============ Material You パレット ============
+
+    private boolean isNight() {
+        return (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                == Configuration.UI_MODE_NIGHT_YES;
+    }
+
+    private void resolvePalette() {
+        boolean night = isNight();
+        boolean dynamic = false;
+        if (Build.VERSION.SDK_INT >= 31) {
+            try {
+                if (night) {
+                    cPrimary = getColor(android.R.color.system_accent1_200);
+                    cOnPrimary = getColor(android.R.color.system_accent1_800);
+                    cSecondaryContainer = getColor(android.R.color.system_accent2_700);
+                    cOnSecondaryContainer = getColor(android.R.color.system_accent2_100);
+                    cSurface = getColor(android.R.color.system_neutral1_900);
+                    cOnSurface = getColor(android.R.color.system_neutral1_100);
+                    cOnSurfaceVariant = getColor(android.R.color.system_neutral2_200);
+                    cSurfaceContainer = getColor(android.R.color.system_neutral1_800);
+                    cOutline = getColor(android.R.color.system_neutral2_400);
+                } else {
+                    cPrimary = getColor(android.R.color.system_accent1_600);
+                    cOnPrimary = getColor(android.R.color.system_accent1_0);
+                    cSecondaryContainer = getColor(android.R.color.system_accent2_100);
+                    cOnSecondaryContainer = getColor(android.R.color.system_accent2_900);
+                    cSurface = getColor(android.R.color.system_neutral1_10);
+                    cOnSurface = getColor(android.R.color.system_neutral1_900);
+                    cOnSurfaceVariant = getColor(android.R.color.system_neutral2_700);
+                    cSurfaceContainer = getColor(android.R.color.system_neutral1_100);
+                    cOutline = getColor(android.R.color.system_neutral2_500);
+                }
+                dynamic = true;
+            } catch (Throwable e) {
+                dynamic = false;
+            }
+        }
+        if (!dynamic) {
+            // M3 ベースライン(紫)。ダイナミックカラー非対応時のフォールバック。
+            if (night) {
+                cPrimary = 0xFFD0BCFF; cOnPrimary = 0xFF381E72;
+                cSecondaryContainer = 0xFF4A4458; cOnSecondaryContainer = 0xFFE8DEF8;
+                cSurface = 0xFF141218; cOnSurface = 0xFFE6E0E9; cOnSurfaceVariant = 0xFFCAC4D0;
+                cSurfaceContainer = 0xFF211F26; cOutline = 0xFF938F99;
+            } else {
+                cPrimary = 0xFF6750A4; cOnPrimary = 0xFFFFFFFF;
+                cSecondaryContainer = 0xFFE8DEF8; cOnSecondaryContainer = 0xFF1D192B;
+                cSurface = 0xFFFEF7FF; cOnSurface = 0xFF1D1B20; cOnSurfaceVariant = 0xFF49454F;
+                cSurfaceContainer = 0xFFF3EDF7; cOutline = 0xFF79747E;
+            }
+        }
+        // エラー系はダイナミックパレットに無いので M3 ベースラインを使う。
+        if (night) { cErrorContainer = 0xFF8C1D18; cOnErrorContainer = 0xFFF9DEDC; }
+        else { cErrorContainer = 0xFFF9DEDC; cOnErrorContainer = 0xFF410E0B; }
+    }
+
+    // ステータスバーを surface 色に合わせ、明暗でアイコン色を切替。
+    private void applySystemBars() {
+        try {
+            getWindow().setStatusBarColor(cSurface);
+            getWindow().setNavigationBarColor(cSurface);
+            View decor = getWindow().getDecorView();
+            boolean lightBg = luminance(cSurface) > 0.5;
+            int flags = decor.getSystemUiVisibility();
+            if (lightBg) {
+                flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            }
+            decor.setSystemUiVisibility(flags);
+        } catch (Throwable ignore) {}
+    }
+
+    private static double luminance(int color) {
+        int r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
+        return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+    }
+
+    private static int withAlpha(int color, int a) {
+        return (color & 0x00FFFFFF) | (a << 24);
+    }
+
+    // ============ UI 構築 ============
+
     private View buildUi() {
+        LinearLayout outer = new LinearLayout(this);
+        outer.setOrientation(LinearLayout.VERTICAL);
+        outer.setBackgroundColor(cSurface);
+
+        // トップアプリバー(M3)。
+        TextView appBar = new TextView(this);
+        appBar.setText("VoiceCord Companion");
+        appBar.setTextColor(cOnSurface);
+        appBar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f);
+        appBar.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        appBar.setPadding(dp(24), dp(20), dp(24), dp(16));
+        outer.addView(appBar, mw());
+
         ScrollView scroll = new ScrollView(this);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        outer.addView(scroll, slp);
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        int pad = dp(16);
-        root.setPadding(pad, pad, pad, pad);
+        root.setPadding(dp(16), 0, dp(16), dp(24));
         scroll.addView(root);
 
+        // 状態カード。
+        LinearLayout statusCard = card(root, null);
         statusLine = new TextView(this);
-        statusLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
-        root.addView(statusLine);
+        statusLine.setTextColor(cOnSurface);
+        statusLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
+        statusCard.addView(statusLine, mw());
         stateLine = new TextView(this);
+        stateLine.setTextColor(cOnSurfaceVariant);
         stateLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        root.addView(stateLine);
-        addSpace(root, 12);
+        addGap(statusCard, stateLine, 4);
 
-        // --- ペアリング ---
-        addHeader(root, "ペアリング");
-        addLabel(root, "1) 「ペアリング開始」を押すと Discord 側に PIN 通知が出ます");
-        pairBtn = addButton(root, "ペアリング開始");
-        addSpace(root, 8);
-        addLabel(root, "2) 通知の PIN を入力して「接続」");
-        pinField = addField(root, "PIN(6桁)", InputType.TYPE_CLASS_NUMBER);
-        confirmBtn = addButton(root, "接続");
-        addSpace(root, 20);
+        // ペアリング。
+        LinearLayout pairCard = card(root, "ペアリング");
+        addLabel(pairCard, "1) 「ペアリング開始」を押すと Discord 側に PIN 通知が出ます", 0);
+        pairBtn = filledButton("ペアリング開始");
+        addGap(pairCard, pairBtn, 10);
+        addLabel(pairCard, "2) 通知の PIN を入力して「接続」", 16);
+        pinField = field("PIN(6桁)", InputType.TYPE_CLASS_NUMBER);
+        addGap(pairCard, pinField, 8);
+        confirmBtn = filledButton("接続");
+        addGap(pairCard, confirmBtn, 10);
 
-        // --- 再生(sound_id) ---
-        addHeader(root, "再生(サウンドボード)");
-        soundIdField = addField(root, "sound_id(数字)", InputType.TYPE_CLASS_NUMBER);
-        gainField = addField(root, "音量 gain(既定 1.0)",
+        // 再生(サウンドボード)。
+        LinearLayout sbCard = card(root, "再生(サウンドボード)");
+        soundIdField = field("sound_id(数字)", InputType.TYPE_CLASS_NUMBER);
+        addGap(sbCard, soundIdField, 0);
+        gainField = field("音量 gain(既定 1.0)",
                 InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         gainField.setText("1.0");
-        playBtn = addButton(root, "再生");
-        stopBtn = addButton(root, "停止");
-        addSpace(root, 20);
+        addGap(sbCard, gainField, 8);
+        playBtn = filledButton("再生");
+        addGap(sbCard, playBtn, 10);
+        stopBtn = tonalButton("停止", cSecondaryContainer, cOnSecondaryContainer);
+        addGap(sbCard, stopBtn, 8);
 
-        // --- ファイル再生(SAF) ---
-        addHeader(root, "ファイル再生(端末内音源)");
+        // ファイル再生。
+        LinearLayout fileCard = card(root, "ファイル再生(端末内音源)");
         fileLabel = new TextView(this);
+        fileLabel.setTextColor(cOnSurfaceVariant);
         fileLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        root.addView(fileLabel);
-        pickBtn = addButton(root, "ファイルを選択");
-        playFileBtn = addButton(root, "選択ファイルを再生");
-        addSpace(root, 20);
+        fileCard.addView(fileLabel, mw());
+        pickBtn = tonalButton("ファイルを選択", cSecondaryContainer, cOnSecondaryContainer);
+        addGap(fileCard, pickBtn, 10);
+        playFileBtn = filledButton("選択ファイルを再生");
+        addGap(fileCard, playFileBtn, 8);
 
-        // --- 状態 ---
-        addHeader(root, "状態");
-        pingBtn = addButton(root, "状態を確認");
-        addSpace(root, 20);
+        // 状態。
+        LinearLayout stateCard = card(root, "状態");
+        pingBtn = tonalButton("状態を確認", cSecondaryContainer, cOnSecondaryContainer);
+        addGap(stateCard, pingBtn, 0);
 
-        // --- 履歴 ---
-        addHeader(root, "履歴(タップで再生)");
+        // 履歴。
+        LinearLayout histCard = card(root, "履歴(タップで再生)");
         historyContainer = new LinearLayout(this);
         historyContainer.setOrientation(LinearLayout.VERTICAL);
-        root.addView(historyContainer, matchWidth());
-        addSpace(root, 20);
+        histCard.addView(historyContainer, mw());
 
-        forgetBtn = addButton(root, "ペアリング解除(token 破棄)");
+        // ペアリング解除(エラートーン)。
+        forgetBtn = tonalButton("ペアリング解除(token 破棄)", cErrorContainer, cOnErrorContainer);
+        LinearLayout.LayoutParams flp = mw();
+        flp.topMargin = dp(4);
+        root.addView(forgetBtn, flp);
 
-        return scroll;
+        return outer;
     }
 
     private void refreshState() {
         boolean paired = token != null;
         statusLine.setText(paired
-                ? "状態: 接続済み（token 保存済み）"
-                : "状態: 未接続（まずペアリングしてください）");
-        soundIdField.setEnabled(paired);
-        gainField.setEnabled(paired);
-        playBtn.setEnabled(paired);
-        stopBtn.setEnabled(paired);
-        pingBtn.setEnabled(paired);
+                ? "接続済み（token 保存済み）"
+                : "未接続（まずペアリングしてください）");
+        setEnabledM3(soundIdField, paired);
+        setEnabledM3(gainField, paired);
+        setEnabledM3(playBtn, paired);
+        setEnabledM3(stopBtn, paired);
+        setEnabledM3(pingBtn, paired);
         // ファイル選択自体は未接続でも可。再生は token 必須。
-        playFileBtn.setEnabled(paired && pickedUri != null);
-        forgetBtn.setEnabled(paired);
+        setEnabledM3(playFileBtn, paired && pickedUri != null);
+        setEnabledM3(forgetBtn, paired);
         fileLabel.setText(pickedUri == null
                 ? "選択ファイル: なし"
                 : "選択ファイル: " + (pickedName != null ? pickedName : pickedUri.getLastPathSegment()));
@@ -404,18 +534,19 @@ public class MainActivity extends Activity implements View.OnClickListener {
         if (history.isEmpty()) {
             TextView t = new TextView(this);
             t.setText("履歴なし");
+            t.setTextColor(cOnSurfaceVariant);
             t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-            historyContainer.addView(t);
+            historyContainer.addView(t, mw());
             return;
         }
         boolean paired = token != null;
+        boolean first = true;
         for (String id : history) {
-            Button b = new Button(this);
-            b.setText("▶ " + id);
+            Button b = tonalButton("▶ " + id, cSecondaryContainer, cOnSecondaryContainer);
             b.setTag(id);              // onClick で sound_id を識別
-            b.setEnabled(paired);
-            b.setOnClickListener(this);
-            historyContainer.addView(b, matchWidth());
+            addGap(historyContainer, b, first ? 0 : 8);
+            setEnabledM3(b, paired);
+            first = false;
         }
     }
 
@@ -423,7 +554,7 @@ public class MainActivity extends Activity implements View.OnClickListener {
         if (historyContainer == null) return;
         for (int i = 0; i < historyContainer.getChildCount(); i++) {
             View c = historyContainer.getChildAt(i);
-            if (c instanceof Button) c.setEnabled(paired);
+            if (c instanceof Button) setEnabledM3(c, paired);
         }
     }
 
@@ -452,54 +583,111 @@ public class MainActivity extends Activity implements View.OnClickListener {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
     }
 
-    // --- UI 部品(コード生成の補助) ---
+    // ============ Material 3 部品(コード生成) ============
 
     private int dp(int v) {
         return (int) TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
     }
 
-    private void addHeader(LinearLayout parent, String text) {
-        TextView t = new TextView(this);
-        t.setText(text);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f);
-        t.setPadding(0, dp(4), 0, dp(6));
-        parent.addView(t);
+    private LinearLayout.LayoutParams mw() {
+        return new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
     }
 
-    private void addLabel(LinearLayout parent, String text) {
+    // 角丸カード(surfaceContainer)。title!=null なら見出しを付ける。
+    private LinearLayout card(LinearLayout parent, String title) {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(cSurfaceContainer);
+        bg.setCornerRadius(dp(24));
+        c.setBackground(bg);
+        int p = dp(16);
+        c.setPadding(p, p, p, p);
+        LinearLayout.LayoutParams lp = mw();
+        lp.bottomMargin = dp(16);
+        parent.addView(c, lp);
+        if (title != null) {
+            TextView t = new TextView(this);
+            t.setText(title);
+            t.setTextColor(cOnSurface);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
+            t.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+            LinearLayout.LayoutParams tlp = mw();
+            tlp.bottomMargin = dp(10);
+            c.addView(t, tlp);
+        }
+        return c;
+    }
+
+    private void addLabel(LinearLayout parent, String text, int topGapDp) {
         TextView t = new TextView(this);
         t.setText(text);
+        t.setTextColor(cOnSurfaceVariant);
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
-        parent.addView(t);
+        addGap(parent, t, topGapDp);
     }
 
-    private EditText addField(LinearLayout parent, String hint, int inputType) {
+    private void addGap(LinearLayout parent, View v, int topGapDp) {
+        LinearLayout.LayoutParams lp = mw();
+        lp.topMargin = dp(topGapDp);
+        parent.addView(v, lp);
+    }
+
+    // M3 アウトライン入力欄。
+    private EditText field(String hint, int inputType) {
         EditText e = new EditText(this);
         e.setHint(hint);
         e.setInputType(inputType);
         e.setSingleLine(true);
-        parent.addView(e, matchWidth());
+        e.setTextColor(cOnSurface);
+        e.setHintTextColor(cOnSurfaceVariant);
+        e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0x00000000);
+        bg.setCornerRadius(dp(12));
+        bg.setStroke(dp(1), cOutline);
+        e.setBackground(bg);
+        e.setPadding(dp(16), dp(14), dp(16), dp(14));
         return e;
     }
 
-    private Button addButton(LinearLayout parent, String label) {
+    // M3 Filled ボタン(primary)。
+    private Button filledButton(String label) {
+        return styledButton(label, cPrimary, cOnPrimary);
+    }
+
+    // M3 Tonal ボタン(container/onContainer 指定)。
+    private Button tonalButton(String label, int container, int onContainer) {
+        return styledButton(label, container, onContainer);
+    }
+
+    private Button styledButton(String label, int bg, int fg) {
         Button b = new Button(this);
         b.setText(label);
+        b.setAllCaps(false);
+        b.setTextColor(fg);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f);
+        b.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        GradientDrawable content = new GradientDrawable();
+        content.setColor(bg);
+        content.setCornerRadius(dp(20));  // M3 の丸みの強いボタン
+        RippleDrawable ripple = new RippleDrawable(
+                ColorStateList.valueOf(withAlpha(fg, 0x33)), content, null);
+        b.setBackground(ripple);
+        b.setStateListAnimator(null);     // 既定の影アニメを消してフラットに
+        b.setElevation(0f);
+        b.setMinHeight(dp(52));
+        b.setPadding(dp(20), dp(12), dp(20), dp(12));
         b.setOnClickListener(this);
-        parent.addView(b, matchWidth());
         return b;
     }
 
-    private void addSpace(LinearLayout parent, int h) {
-        View s = new View(this);
-        parent.addView(s, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(h)));
-    }
-
-    private LinearLayout.LayoutParams matchWidth() {
-        return new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    // M3 の無効表示: 38% 透過(コンテナ/テキストとも)。
+    private void setEnabledM3(View v, boolean on) {
+        v.setEnabled(on);
+        v.setAlpha(on ? 1f : 0.38f);
     }
 
     // 順序付きブロードキャストの結果 token を受ける名前付きレシーバ(匿名クラス回避)。
